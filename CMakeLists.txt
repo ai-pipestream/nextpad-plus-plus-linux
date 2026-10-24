@@ -39,10 +39,14 @@ set(NPP_HAVE_ONNXRUNTIME 0)
 if(NPP_WITH_ONNXRUNTIME)
     find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_c_api.h
         HINTS "${ONNXRUNTIME_ROOT}/include" "$ENV{ONNXRUNTIME_ROOT}/include"
+              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/current/include"
+              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/include"
               /opt/onnxruntime/include /usr/include /usr/local/include)
     find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
         HINTS "${ONNXRUNTIME_ROOT}/lib" "${ONNXRUNTIME_ROOT}/lib64"
               "$ENV{ONNXRUNTIME_ROOT}/lib" "$ENV{ONNXRUNTIME_ROOT}/lib64"
+              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/current/lib"
+              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/lib"
               /opt/onnxruntime/lib /usr/lib /usr/local/lib)
     if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
         set(NPP_HAVE_ONNXRUNTIME 1)
@@ -380,3 +384,9 @@ if(NPP_HAVE_ONNXRUNTIME)
         BUILD_RPATH "${_ort_libdir}")
 endif()
 add_test(NAME semantic COMMAND npp_semantic_tests)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME semantic-runtime-detection
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/semantic/test_runtime_detection.py")
+endif()

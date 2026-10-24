@@ -10,6 +10,8 @@
 #ifndef NPP_MODEL_ZOO_H
 #define NPP_MODEL_ZOO_H
 
+#include "SemanticHeatmapColors.h"
+
 #include <string>
 #include <vector>
 
@@ -25,6 +27,7 @@ struct ModelSpec {
     int dimension = 0;
     std::string pooling; /* "mean" */
     int max_tokens = 256;
+    SemanticHeatmap::Profile heatmap_profile = SemanticHeatmap::Profile::MiniLM;
     ModelFile vocab;
     ModelFile model;
 };

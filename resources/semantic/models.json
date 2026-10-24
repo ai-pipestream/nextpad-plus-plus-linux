@@ -1,9 +1,10 @@
 {
-  "default": "all-MiniLM-L6-v2",
+  "default": "all-MiniLM-L6-v2-fp32",
   "models": [
     {
       "id": "all-MiniLM-L6-v2",
       "name": "MiniLM-L6 int8",
+      "heatmap_profile": "minilm",
       "dimension": 384,
       "pooling": "mean",
       "max_tokens": 256,
@@ -28,6 +29,7 @@
     {
       "id": "all-MiniLM-L6-v2-fp32",
       "name": "MiniLM-L6 fp32",
+      "heatmap_profile": "minilm",
       "dimension": 384,
       "pooling": "mean",
       "max_tokens": 256,
@@ -47,6 +49,7 @@
     {
       "id": "paraphrase-MiniLM-L3-v2",
       "name": "MiniLM-L3 int8",
+      "heatmap_profile": "minilm",
       "dimension": 384,
       "pooling": "mean",
       "max_tokens": 128,

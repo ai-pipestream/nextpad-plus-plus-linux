@@ -110,13 +110,14 @@ struct Controller {
     GtkWidget *sens_dd = nullptr;
     GtkWidget *ep_dd = nullptr;
     GtkWidget *swatch[6] = {};
+    GtkCssProvider *legend_css = nullptr;
 
     bool ui_ready = false;
     bool open = false;
     int sensitivity = 0;
     unsigned band_mask = 0;
     std::string model_id;
-    std::string ep_id = "cpu";
+    std::string ep_id = "auto";
     std::vector<std::string> model_ids;
     std::vector<std::string> ep_ids;
 
@@ -229,6 +230,29 @@ struct Controller {
         }
     }
 
+    SemanticHeatmap::Profile heatmap_profile() const
+    {
+        const ModelSpec *spec = zoo.find(model_id);
+        return spec ? spec->heatmap_profile : SemanticHeatmap::Profile::MiniLM;
+    }
+
+    void refresh_legend()
+    {
+        if (!legend_css) return;
+        GString *css = g_string_new("");
+        for (int i = 0; i < 6; ++i) {
+            double sample = SemanticHeatmap::legendScore(heatmap_profile(), i);
+            uint32_t bgr = SemanticHeatmap::colorBGR(sample, 0, heatmap_profile());
+            g_string_append_printf(css,
+                "button.sem-band-%d { background: #%02x%02x%02x;"
+                " min-width: 16px; min-height: 16px; padding: 0; border-radius: 3px; }"
+                "button.sem-band-%d:checked { box-shadow: inset 0 0 0 2px currentColor; }",
+                i, bgr & 255, (bgr >> 8) & 255, (bgr >> 16) & 255, i);
+        }
+        gtk_css_provider_load_from_string(legend_css, css->str);
+        g_string_free(css, TRUE);
+    }
+
     void paint(const std::vector<SemanticHit> &hits)
     {
         if (!sci) return;
@@ -237,7 +261,7 @@ struct Controller {
         send(sci, SCI_INDICATORCLEARRANGE, 0, doc_len);
         std::set<int> want_lines;
         for (const SemanticHit &hit : hits) {
-            int band = SemanticHeatmap::bandForScore(hit.score);
+            int band = SemanticHeatmap::bandForScore(hit.score, heatmap_profile());
             if (band_mask && (band < 0 || !(band_mask & (1u << band)))) continue;
             if (hit.sentence_id < first_id) continue;
             size_t idx = static_cast<size_t>(hit.sentence_id - first_id);
@@ -245,7 +269,7 @@ struct Controller {
             const Span &span = spans[idx];
             if (span.byte_start >= doc_len || span.byte_length <= 0) continue;
             long len = std::min(span.byte_length, static_cast<int64_t>(doc_len - span.byte_start));
-            uint32_t color = SemanticHeatmap::colorBGR(hit.score, sensitivity);
+            uint32_t color = SemanticHeatmap::colorBGR(hit.score, sensitivity, heatmap_profile());
             send(sci, SCI_SETINDICATORVALUE,
                  static_cast<uptr_t>(color | SC_INDICVALUEBIT), 0);
             send(sci, SCI_INDICATORFILLRANGE, static_cast<uptr_t>(span.byte_start), len);
@@ -417,7 +441,7 @@ struct Controller {
         cfg.execution_provider = want_ep;
         auto created = make_onnx_provider(cfg, error);
         if (!created) return false;
-        if (loaded_model != spec->id) cache.clear();
+        if (loaded_model != spec->id || loaded_ep != want_ep) cache.clear();
         provider = std::move(created);
         loaded_model = spec->id;
         loaded_ep = want_ep;
@@ -530,7 +554,7 @@ struct Controller {
             }
             size_t total = spans_now.size();
             size_t n_embedded = embedded;
-            std::string backend = backend_name;
+            std::string backend = provider->backend_name();
             post_main([this, gen, hits = std::move(hits), done, total, n_embedded, backend, first] {
                 if (gen != build_gen.load()) return;
                 next_id = first + static_cast<int64_t>(total);
@@ -682,6 +706,7 @@ void on_model(GObject *, GParamSpec *, gpointer)
     if (sel >= ctrl().model_ids.size()) return;
     if (ctrl().model_ids[sel] == ctrl().model_id) return;
     ctrl().model_id = ctrl().model_ids[sel];
+    ctrl().refresh_legend();
     ctrl().save_prefs();
     if (ctrl().open) ctrl().rebuild_now();
 }
@@ -764,6 +789,7 @@ GtkWidget *semantic_search_bar_new(void)
         for (char &ch : label_ep)
             if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
         if (ep.id == "cpu") label_ep = "CPU";
+        if (ep.id == "auto") label_ep = "Automatic";
         gtk_string_list_append(eps, label_ep.c_str());
         c.ep_ids.push_back(ep.id);
     }
@@ -794,19 +820,7 @@ GtkWidget *semantic_search_bar_new(void)
         "Heatmap sensitivity. Broad paints weaker matches green. Strict requires stronger matches. Scores stay the same.");
 
     GtkWidget *swatches = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    GString *css = g_string_new("");
     for (int i = 0; i < 6; ++i) {
-        uint32_t bgr = SemanticHeatmap::colorBGR(SemanticHeatmap::kLegendScores[i]);
-        int r = bgr & 255;
-        int g = (bgr >> 8) & 255;
-        int b = (bgr >> 16) & 255;
-        g_string_append_printf(css,
-            "button.sem-band-%d {"
-            " background: #%02x%02x%02x;"
-            " min-width: 16px; min-height: 16px;"
-            " padding: 0; border-radius: 3px; }"
-            "button.sem-band-%d:checked { box-shadow: inset 0 0 0 2px currentColor; }",
-            i, r, g, b, i);
         c.swatch[i] = gtk_toggle_button_new();
         char cls[32];
         std::snprintf(cls, sizeof cls, "sem-band-%d", i);
@@ -821,13 +835,13 @@ GtkWidget *semantic_search_bar_new(void)
         g_signal_connect(c.swatch[i], "toggled", G_CALLBACK(on_swatch), nullptr);
         gtk_box_append(GTK_BOX(swatches), c.swatch[i]);
     }
-    GtkCssProvider *provider = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(provider, css->str);
+    c.legend_css = gtk_css_provider_new();
     gtk_style_context_add_provider_for_display(
-        gdk_display_get_default(), GTK_STYLE_PROVIDER(provider),
+        gdk_display_get_default(), GTK_STYLE_PROVIDER(c.legend_css),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(provider);
-    g_string_free(css, TRUE);
+    // The display owns the provider for the application lifetime.
+    g_object_unref(c.legend_css);
+    c.refresh_legend();
 
     c.spinner = gtk_spinner_new();
     c.status = gtk_label_new("");

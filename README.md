@@ -217,3 +217,81 @@ Unlike macOS there are many flavors of Linux and I bet we will see some paper-cu
 
 
 *Nextpad++ is the full native port of Notepad++ — on Linux, built in C on GTK4 on top of Scintilla and Lexilla, with everything the desktop deserves: real menus, real dialogs, dark mode, 137 UI languages, Git, spell check, and a 5 MB download. Free and open, GPL-3, like the original.*
+
+### Semantic search: CPU, NVIDIA CUDA, and Intel GPUs
+
+Linux supports CPU, NVIDIA CUDA, and Intel OpenVINO. These are execution
+providers behind the same editor feature, not separate editor plugins.
+Run `tools/setup-semantic-runtime.sh` before configuring CMake. It checks for a
+working CUDA device plus CUDA/cuBLAS/cuDNN libraries, then Intel render devices,
+and otherwise installs the CPU runtime. `nvcc` alone is not sufficient and is
+not required for inference. The script uses an isolated runtime prefix and
+requires `curl` plus either `uv` (Python 3.12) or a compatible Python with pip.
+It does not install or modify GPU drivers or system CUDA libraries.
+
+The default installation prefix is `.cache/onnxruntime`; CMake discovers its
+`current` SDK link. Follow the printed CMake command when changing an existing
+build's runtime. Pass `[prefix] [auto|cpu|cuda|openvino]` to override installation
+selection. CUDA 12 uses ONNX Runtime 1.24.1; CUDA 13 uses 1.31.0; OpenVINO uses
+1.24.1. NVIDIA requires compatible cuDNN 9. Intel requires its GPU driver and
+access to `/dev/dri/renderD*` (`clinfo -l` checks OpenCL discovery).
+
+Jetson needs an SDK built for its GPU architecture: generic ARM64 CUDA wheels
+can target server GPUs and lack Orin's `sm_87` kernels. The setup script reuses
+`ONNXRUNTIME_ROOT` or discovers an existing SDK in `/opt/onnxruntime`,
+`/usr/local/onnxruntime`, `~/.local/onnxruntime`, or `~/ort-*`. If none exists it
+reports the required SDK instead of installing an incompatible wheel. For Orin,
+build ONNX Runtime with `CMAKE_CUDA_ARCHITECTURES=87` and the installed JetPack
+CUDA/cuDNN. Runtime versions alone do not prove GPU compatibility.
+
+Semantic search defaults to **Automatic** execution and fp32 MiniLM. Automatic
+tries CUDA, then OpenVINO GPU, then CPU, within the linked runtime's available
+providers. It verifies real inference; failed, non-finite, or invalid GPU output
+retries on CPU. OpenVINO uses GPU/FP32 and CUDA disables TF32 for score parity.
+Existing saved choices are preserved; select Automatic for an existing profile.
+The status line names the active backend.
+
+Colour calibration belongs to the **model**, not the CPU/GPU. Every manifest
+entry declares `heatmap_profile`; the current MiniLM exports use `minilm` on all
+three Linux backends. The shared colour code also preserves the Apple Sentence
+and Contextual reference profiles from SemanticSearch.macos commit `ed3fcd1`.
+Those Apple models remain macOS-only; their different score ranges must not be
+applied to MiniLM merely because the execution device changed. Changing model
+refreshes its legend and rebuilds the heatmap. Bands use raw score space, and
+legend swatches use Standard sensitivity, matching the Mac interaction.
+
+For hardware validation, supply `model_fp32.onnx`, the manifest's architecture
+specific int8 model, and `vocab.txt` in a test directory:
+
+```sh
+cmake -S . -B build -DNPP_SEMANTIC_TEST_MODEL_DIR=/path/to/models
+cmake --build build --target npp_semantic_tests
+NPP_SEMANTIC_REQUIRE_GPU=1 ctest --test-dir build --output-on-failure
+```
+
+The test fails on CPU fallback, compares automatic and CPU embeddings above
+0.999 cosine similarity, and checks score, band, and colour agreement at all
+three sensitivities. The AVX2 int8 reference is only used on x86; ARM tests its
+own export against the shared semantic reference. Colour tests cover all three
+model profiles. `python3 tests/semantic/test_runtime_detection.py` checks setup
+selection without requiring GPU hardware.
+
+The setup script is for local builds. Distributing a GPU-enabled package also
+requires packaging its provider plugins and runtime dependencies;
+`NPP_BUNDLE_ONNXRUNTIME` alone bundles only the core ONNX Runtime library.
+
+Validated on 2026-10-24 with real C++ embedding inference:
+
+| Host/device | Runtime | Result |
+| --- | --- | --- |
+| Intel Arc Pro B70 | ONNX Runtime OpenVINO 1.24.1 | Automatic selects Intel GPU; CPU score/colour parity passes |
+| `krick`, RTX 4080 SUPER | ONNX Runtime CUDA 1.24.1, CUDA 12.4 | Automatic selects CUDA; CPU score/colour parity passes |
+| `nano1`, ARM64 Orin | Installed Jetson ONNX Runtime 1.24.0, CUDA 13.2 | Automatic selects CUDA; ARM model and CPU score/colour parity pass |
+| CPU-only runtime / hidden Intel device | ONNX Runtime 1.24.1 | Automatic CPU fallback passes |
+
+The generic ONNX Runtime 1.31.0 ARM64 CUDA wheel failed on Orin with
+`cudaErrorNoKernelImageForDevice`; setup therefore discovers the installed
+Jetson SDK instead. The semantic engine, setup selection, and colour tests pass.
+The changed GTK source passes syntax checking; a full editor/UI run remains
+unverified because this checkout lacks its vendored Scintilla build and the
+host's development packages have dependency conflicts.

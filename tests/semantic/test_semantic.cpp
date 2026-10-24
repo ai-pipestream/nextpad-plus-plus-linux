@@ -190,6 +190,45 @@ void test_colors()
     expect(SemanticHeatmap::colorBGR(std::nan("")) == 0x8E8E8Eu, "nan color");
 }
 
+void test_model_color_profiles()
+{
+    using namespace SemanticHeatmap;
+    expect(colorBGR(0.14, 0, Profile::AppleSentence) == 0x4145D6, "Apple Sentence red stop");
+    expect(colorBGR(0.22, 0, Profile::AppleSentence) == 0x6469B2, "Apple Sentence brown stop");
+    expect(colorBGR(0.30, 0, Profile::AppleSentence) == 0x8E8E8E, "Apple Sentence grey start");
+    expect(colorBGR(0.42, 0, Profile::AppleSentence) == 0x8E8E8E, "Apple Sentence grey end");
+    expect(colorBGR(0.50, 0, Profile::AppleSentence) == 0x71CC2E, "Apple Sentence green stop");
+    expect(colorBGR(0.68, 0, Profile::AppleSentence) == 0x458A0B, "Apple Sentence deep green");
+    expect(colorBGR(0.82, 0, Profile::AppleContextual) == 0x4145D6, "Apple Contextual red stop");
+    expect(colorBGR(0.95, 0, Profile::AppleContextual) == 0x458A0B, "Apple Contextual deep green");
+    for (auto profile : {Profile::MiniLM, Profile::AppleSentence, Profile::AppleContextual}) {
+        unsigned count;
+        const auto *stops = stopsFor(profile, count);
+        for (int sensitivity : {-1, 0, 1}) {
+            double exponent = sensitivity < 0 ? 1.4 : sensitivity > 0 ? 0.7 : 1.0;
+            for (unsigned i = 0; i < count; ++i) {
+                double input = std::pow(stops[i].score, 1.0 / exponent);
+                uint32_t actual = colorBGR(input, sensitivity, profile);
+                expect(std::abs(int(actual & 255) - stops[i].r) <= 1 &&
+                       std::abs(int((actual >> 8) & 255) - stops[i].g) <= 1 &&
+                       std::abs(int((actual >> 16) & 255) - stops[i].b) <= 1,
+                       "calibrated stops at every sensitivity");
+            }
+            expect(colorBGR(std::nan(""), sensitivity, profile) == 0x8E8E8E, "invalid score grey");
+        }
+        uint32_t previous = 0;
+        for (int i = 0; i < 6; ++i) {
+            double sample = legendScore(profile, i);
+            expect(bandForScore(sample, profile) == i, "model legend maps to its band");
+            uint32_t color = colorBGR(sample, 0, profile);
+            expect(i == 0 || color != previous, "legend has distinct swatches");
+            previous = color;
+        }
+    }
+    Profile profile;
+    expect(!profileFromID("cuda", profile), "hardware is not a heatmap profile");
+}
+
 void test_sentences()
 {
     auto spans = split_sentences("One sentence. Two sentences.");
@@ -261,7 +300,7 @@ void test_manifest()
     ModelZoo zoo;
     std::string error;
     expect(zoo.load_file(SEMANTIC_MANIFEST, error), error.empty() ? "manifest" : error);
-    expect(zoo.default_id() == "all-MiniLM-L6-v2", "default id");
+    expect(zoo.default_id() == "all-MiniLM-L6-v2-fp32", "default id");
     expect(zoo.models().size() == 3, "three models");
     const ModelSpec *spec = zoo.find("all-MiniLM-L6-v2");
     expect(spec != nullptr, "default spec");
@@ -395,12 +434,88 @@ void test_embeddings()
     compare_model(dir + "/model_fp32.onnx",
                   std::string(SEMANTIC_FIXTURE_DIR) + "/golden_st.txt",
                   256, 0.999, 0.999, "fp32 vs sentence-transformers");
+#if defined(__aarch64__)
+    // The AVX2 quantization reference is architecture-specific. Test the
+    // manifest's ARM export against the shared semantic reference instead.
+    compare_model(dir + "/model_qint8_arm64.onnx",
+                  std::string(SEMANTIC_FIXTURE_DIR) + "/golden_st.txt",
+                  256, 0.93, 0.97, "ARM int8 vs sentence-transformers");
+#else
     compare_model(dir + "/model_quint8_avx2.onnx",
                   std::string(SEMANTIC_FIXTURE_DIR) + "/golden_int8.txt",
                   256, 0.999, 0.999, "int8 vs ort reference");
     compare_model(dir + "/model_quint8_avx2.onnx",
                   std::string(SEMANTIC_FIXTURE_DIR) + "/golden_st.txt",
                   256, 0.93, 0.97, "int8 vs sentence-transformers");
+#endif
+}
+
+void test_automatic_provider()
+{
+    const bool require_gpu = std::getenv("NPP_SEMANTIC_REQUIRE_GPU") != nullptr;
+    OnnxProviderConfig cfg;
+    cfg.model_path = model_dir() + "/model_fp32.onnx";
+    cfg.vocab_path = model_dir() + "/vocab.txt";
+    cfg.dimension = 384;
+    cfg.max_tokens = 256;
+    cfg.pooling = "mean";
+    if (!file_ok(cfg.model_path) || !file_ok(cfg.vocab_path)) {
+        expect(!require_gpu, "GPU test requires fp32 model and vocab");
+        std::cout << "skip automatic provider (model missing)\n";
+        return;
+    }
+    std::string error;
+    auto automatic = make_onnx_provider(cfg, error);
+    expect(automatic != nullptr, error);
+    if (!automatic) return;
+    std::cout << "automatic backend: " << automatic->backend_name() << "\n";
+    if (require_gpu)
+        expect(automatic->backend_name().find("GPU") != std::string::npos &&
+               automatic->backend_name().find("CPU") == std::string::npos,
+               "automatic selection must execute on GPU");
+    cfg.execution_provider = "cpu";
+    auto cpu = make_onnx_provider(cfg, error);
+    expect(cpu != nullptr, error);
+    if (!cpu) return;
+    const std::vector<std::string> texts = {
+        "The hospital runs on its backup generator.", "A power cut.",
+        "Children drew pictures at school.", "The emergency supply kept the ward lit."
+    };
+    std::vector<float> actual, reference;
+    expect(automatic->embed_batch(texts, actual, error, {}), error);
+    expect(cpu->embed_batch(texts, reference, error, {}), error);
+    if (require_gpu) expect(automatic->backend_name().find("CPU") == std::string::npos,
+                            "GPU must remain active after inference");
+    expect(actual.size() == texts.size() * 384 && actual.size() == reference.size(), "GPU batch size");
+    if (actual.size() != texts.size() * 384 || actual.size() != reference.size()) return;
+    for (size_t i = 0; i < texts.size(); ++i) {
+        std::vector<float> a(actual.begin() + i * 384, actual.begin() + (i + 1) * 384);
+        std::vector<float> b(reference.begin() + i * 384, reference.begin() + (i + 1) * 384);
+        expect(cosine(a, b) > 0.999, "automatic/CPU embedding parity");
+        for (float v : a) expect(std::isfinite(v), "finite automatic embedding");
+        std::vector<float> aq(actual.begin(), actual.begin() + 384);
+        std::vector<float> bq(reference.begin(), reference.begin() + 384);
+        double as = cosine(aq, a), bs = cosine(bq, b);
+        expect(std::abs(as - bs) < 0.002, "CPU/GPU similarity scores agree");
+        expect(SemanticHeatmap::bandForScore(as) == SemanticHeatmap::bandForScore(bs),
+               "CPU/GPU heatmap bands agree");
+        for (int sensitivity : {-1, 0, 1}) {
+            auto ac = SemanticHeatmap::colorBGR(as, sensitivity);
+            auto bc = SemanticHeatmap::colorBGR(bs, sensitivity);
+            for (int shift : {0, 8, 16})
+                expect(std::abs(int((ac >> shift) & 255) - int((bc >> shift) & 255)) <= 3,
+                       "CPU/GPU heatmap colours agree");
+        }
+    }
+    bool cuda_present = false;
+    for (const auto &ep : execution_provider_catalog()) if (ep.id == "cuda") cuda_present = true;
+    if (!cuda_present) {
+        cfg.execution_provider = "cuda";
+        auto fallback = make_onnx_provider(cfg, error);
+        expect(fallback && fallback->backend_name().find("CPU") != std::string::npos,
+               "missing GPU falls back to CPU");
+        if (fallback) expect(fallback->embed_batch(texts, actual, error, {}), error);
+    }
 }
 
 int bench()
@@ -466,6 +581,7 @@ int main(int argc, char **argv)
 
     test_tokens();
     test_colors();
+    test_model_color_profiles();
     test_sentences();
     test_index();
     test_manifest();
@@ -473,8 +589,10 @@ int main(int argc, char **argv)
 #if NPP_HAVE_ONNXRUNTIME
     if (do_bench) return bench();
     test_embeddings();
+    test_automatic_provider();
 #else
     (void)do_bench;
+    expect(std::getenv("NPP_SEMANTIC_REQUIRE_GPU") == nullptr, "GPU required but runtime not linked");
     std::cout << "skip embeddings (ONNX Runtime not linked)\n";
 #endif
     if (g_fails) {

@@ -33,9 +33,7 @@ struct KnownEp {
 constexpr KnownEp kKnown[] = {
     {"cpu", "CPUExecutionProvider"},
     {"cuda", "CUDAExecutionProvider"},
-    {"migraphx", "MIGraphXExecutionProvider"},
     {"openvino", "OpenVINOExecutionProvider"},
-    {"webgpu", "WebGPUExecutionProvider"},
 };
 
 const KnownEp *known_by_id(const std::string &id)
@@ -102,11 +100,6 @@ bool name_present(const std::vector<std::string> &names, const char *want)
 {
     for (const std::string &n : names)
         if (g_ascii_strcasecmp(n.c_str(), want) == 0) return true;
-    if (g_ascii_strcasecmp(want, "WebGPUExecutionProvider") == 0) {
-        for (const std::string &n : names)
-            if (g_ascii_strcasecmp(n.c_str(), "WebGpuExecutionProvider") == 0)
-                return true;
-    }
     return false;
 }
 
@@ -133,6 +126,7 @@ public:
 
 private:
     bool collect_io(std::string &error);
+    bool fallback_cpu(std::string &error);
     bool make_options(bool try_gpu, const KnownEp *want, std::string &error);
     bool run_items(const std::vector<TokenItem> &items, size_t base, size_t n,
                    std::vector<float> &out, std::string &error);
@@ -143,6 +137,8 @@ private:
     int max_tokens_ = 256;
     bool ready_ = false;
     std::string backend_;
+    std::string model_path_;
+    bool using_gpu_ = false;
 };
 
 bool OnnxEmbeddingProvider::make_options(bool try_gpu, const KnownEp *want, std::string &error)
@@ -156,7 +152,9 @@ bool OnnxEmbeddingProvider::make_options(bool try_gpu, const KnownEp *want, std:
     if (!ort_.check(api->SetIntraOpNumThreads(ort_.opts, kIntraOpThreads), error)) return false;
     if (!ort_.check(api->SetInterOpNumThreads(ort_.opts, 1), error)) return false;
     if (!ort_.check(api->SetSessionExecutionMode(ort_.opts, ORT_SEQUENTIAL), error)) return false;
-    if (!ort_.check(api->SetSessionGraphOptimizationLevel(ort_.opts, ORT_ENABLE_ALL), error))
+    if (!ort_.check(api->SetSessionGraphOptimizationLevel(ort_.opts,
+            try_gpu && want && std::strcmp(want->id, "openvino") == 0
+                ? ORT_DISABLE_ALL : ORT_ENABLE_ALL), error))
         return false;
     /* Drop spinning waits so the editor thread keeps getting CPU time. */
     OrtStatus *spin = api->AddSessionConfigEntry(ort_.opts, "session.intra_op.allow_spinning", "0");
@@ -164,19 +162,28 @@ bool OnnxEmbeddingProvider::make_options(bool try_gpu, const KnownEp *want, std:
     spin = api->AddSessionConfigEntry(ort_.opts, "session.inter_op.allow_spinning", "0");
     if (spin) api->ReleaseStatus(spin);
     if (try_gpu && want) {
-        const char *keys[] = {"device_id"};
-        const char *vals[] = {"0"};
-        size_t nkeys = (std::strcmp(want->id, "cuda") == 0) ? 1 : 0;
-        if (!ort_.check(api->SessionOptionsAppendExecutionProvider(
-                            ort_.opts, want->ort_name, keys, vals, nkeys),
-                        error))
-            return false;
+        if (std::strcmp(want->id, "cuda") == 0) {
+            OrtCUDAProviderOptionsV2 *options = nullptr;
+            if (!ort_.check(api->CreateCUDAProviderOptions(&options), error)) return false;
+            // Keep the same fp32 scoring/colour behaviour as CPU and Intel.
+            const char *keys[] = {"device_id", "use_tf32"};
+            const char *values[] = {"0", "0"};
+            bool ok = ort_.check(api->UpdateCUDAProviderOptions(options, keys, values, 2), error) &&
+                      ort_.check(api->SessionOptionsAppendExecutionProvider_CUDA_V2(ort_.opts, options), error);
+            api->ReleaseCUDAProviderOptions(options);
+            return ok;
+        }
+        const char *keys[] = {"device_type", "precision"};
+        const char *vals[] = {"GPU", "FP32"};
+        return ort_.check(api->SessionOptionsAppendExecutionProvider(
+            ort_.opts, "OpenVINO", keys, vals, 2), error);
     }
     return true;
 }
 
 bool OnnxEmbeddingProvider::open(const OnnxProviderConfig &config, std::string &error)
 {
+    model_path_ = config.model_path;
     dim_ = config.dimension;
     max_tokens_ = config.max_tokens;
     if (config.pooling != "mean") {
@@ -195,61 +202,67 @@ bool OnnxEmbeddingProvider::open(const OnnxProviderConfig &config, std::string &
         return false;
 
     std::vector<std::string> present = available_ort_names(api);
-    std::string requested = config.execution_provider.empty() ? "cpu"
+    std::string requested = config.execution_provider.empty() ? "auto"
                                                               : lower_copy(config.execution_provider);
-    const KnownEp *want = known_by_id(requested);
-    if (!want) {
+    const bool automatic = requested == "auto";
+    const KnownEp *want = automatic ? nullptr : known_by_id(requested);
+    if (!automatic && !want) {
         error = "unknown execution provider " + requested;
         return false;
     }
-    bool want_cpu = std::strcmp(want->id, "cpu") == 0;
-    bool gpu_present = !want_cpu && name_present(present, want->ort_name);
-
-    std::string gpu_error;
     bool used_gpu = false;
-    if (gpu_present) {
-        if (make_options(true, want, error) &&
-            ort_.check(api->CreateSession(ort_.env, config.model_path.c_str(), ort_.opts, &ort_.session),
-                       gpu_error)) {
+    for (const KnownEp &candidate : kKnown) {
+        if (std::strcmp(candidate.id, "cpu") == 0) continue;
+        if (!automatic && want != &candidate) continue;
+        if (!name_present(present, candidate.ort_name)) continue;
+        if (make_options(true, &candidate, error) &&
+            ort_.check(api->CreateSession(ort_.env, model_path_.c_str(), ort_.opts, &ort_.session), error)) {
+            want = &candidate;
             used_gpu = true;
-        } else {
-            if (ort_.session) {
-                api->ReleaseSession(ort_.session);
-                ort_.session = nullptr;
-            }
-            if (gpu_error.empty()) gpu_error = error;
-            error.clear();
+            break;
         }
+        if (ort_.session) api->ReleaseSession(ort_.session);
+        ort_.session = nullptr;
+        error.clear();
     }
     if (!used_gpu) {
-        if (!make_options(false, want, error)) return false;
-        if (!ort_.check(api->CreateSession(ort_.env, config.model_path.c_str(), ort_.opts, &ort_.session),
-                        error))
+        if (!make_options(false, nullptr, error)) return false;
+        if (!ort_.check(api->CreateSession(ort_.env, model_path_.c_str(), ort_.opts, &ort_.session), error))
             return false;
     }
     if (!ort_.check(api->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &ort_.memory), error))
         return false;
     if (!collect_io(error)) return false;
 
-    if (used_gpu) {
-        backend_ = std::string("ONNX Runtime ") + want->id;
-    } else if (!want_cpu && gpu_present) {
-        backend_ = std::string("ONNX Runtime CPU (") + want->id + " unavailable)";
-    } else if (!want_cpu) {
-        backend_ = std::string("ONNX Runtime CPU (") + want->id + " not in this build)";
-    } else {
-        backend_ = "ONNX Runtime CPU";
-        std::string extra;
-        for (const KnownEp &ep : kKnown) {
-            if (std::strcmp(ep.id, "cpu") == 0) continue;
-            if (name_present(present, ep.ort_name)) {
-                if (!extra.empty()) extra += ", ";
-                extra += ep.id;
-            }
-        }
-        if (!extra.empty()) backend_ += " (" + extra + " detected)";
-    }
+    using_gpu_ = used_gpu;
+    backend_ = used_gpu ? std::string("ONNX Runtime ") + want->id + " GPU"
+                        : "ONNX Runtime CPU";
+    if (!used_gpu && requested != "cpu") backend_ += " (GPU unavailable)";
     ready_ = true;
+    // Session creation alone does not prove that dynamic GPU inference works.
+    if (using_gpu_) {
+        std::vector<float> probe;
+        if (!embed_batch({"Semantic search.", "A longer sentence to test padding."}, probe, error, {}))
+            return false;
+    }
+    return true;
+}
+
+bool OnnxEmbeddingProvider::fallback_cpu(std::string &error)
+{
+    using_gpu_ = false;
+    if (ort_.session) ort_.api->ReleaseSession(ort_.session);
+    ort_.session = nullptr;
+    ort_.input_names.clear();
+    ort_.output_name.clear();
+    error.clear();
+    if (!make_options(false, nullptr, error) ||
+        !ort_.check(ort_.api->CreateSession(ort_.env, model_path_.c_str(), ort_.opts, &ort_.session), error) ||
+        !collect_io(error)) {
+        ready_ = false;
+        return false;
+    }
+    backend_ = "ONNX Runtime CPU (GPU inference failed)";
     return true;
 }
 
@@ -316,7 +329,10 @@ bool OnnxEmbeddingProvider::embed_batch(const std::vector<std::string> &texts,
     out.assign(texts.size() * static_cast<size_t>(dim_), 0.f);
     for (size_t base = 0; base < items.size(); base += kBatchSize) {
         size_t n = std::min(kBatchSize, items.size() - base);
-        if (!run_items(items, base, n, out, error)) return false;
+        if (!run_items(items, base, n, out, error)) {
+            if (!using_gpu_ || !fallback_cpu(error) || !run_items(items, base, n, out, error))
+                return false;
+        }
         if (progress) {
             std::vector<size_t> done;
             done.reserve(n);
@@ -453,7 +469,7 @@ bool OnnxEmbeddingProvider::run_items(const std::vector<TokenItem> &items, size_
 
     if (nd == 3) {
         int64_t b = dims[0], s = dims[1], d = dims[2];
-        if (b != static_cast<int64_t>(n) || d != dim_) {
+        if (b != static_cast<int64_t>(n) || s != static_cast<int64_t>(seq) || d != dim_) {
             api->ReleaseValue(result);
             error = "model output shape does not match the manifest dimension";
             return false;
@@ -488,6 +504,21 @@ bool OnnxEmbeddingProvider::run_items(const std::vector<TokenItem> &items, size_
         return false;
     }
     api->ReleaseValue(result);
+    for (size_t k = 0; k < n; ++k) {
+        const float *row = out.data() + items[base + k].orig * static_cast<size_t>(dim_);
+        double norm = 0;
+        for (int j = 0; j < dim_; ++j) {
+            if (!std::isfinite(row[j])) {
+                error = "model produced non-finite embeddings";
+                return false;
+            }
+            norm += static_cast<double>(row[j]) * row[j];
+        }
+        if (norm < 0.5 || norm > 1.5) {
+            error = "model produced invalid embedding norm";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -498,6 +529,7 @@ bool OnnxEmbeddingProvider::run_items(const std::vector<TokenItem> &items, size_
 std::vector<ExecProviderInfo> execution_provider_catalog()
 {
     std::vector<ExecProviderInfo> out;
+    out.push_back({"auto", "Automatic", NPP_HAVE_ONNXRUNTIME != 0});
 #if NPP_HAVE_ONNXRUNTIME
     const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
     std::vector<std::string> present = api ? available_ort_names(api) : std::vector<std::string>{};

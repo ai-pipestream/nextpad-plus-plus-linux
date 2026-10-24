@@ -2,10 +2,9 @@
  * ExecutionProviders.h
  *
  * ONNX Runtime execution providers the embedding backend can target.
- * This build creates a CPU session. If a GPU provider is requested and
- * the loaded libonnxruntime reports it, the session tries that provider
- * and falls back to CPU when session creation fails. The names are the
- * ones ORT advertises: CUDA, MIGraphX, OpenVINO, WebGPU.
+ * Automatic selection tries GPU providers advertised by the loaded runtime,
+ * then CPU. OpenVINO explicitly targets GPU with FP32 precision. Initialization
+ * includes real inference; failed or non-finite GPU inference retries on CPU.
  *
  * TurboEmbed (https://github.com/ai-pipestream/turboembed) is a later
  * backend behind the same EmbeddingProvider. It is not linked here.
@@ -23,12 +22,12 @@
 #include <vector>
 
 struct ExecProviderInfo {
-    std::string id;       /* cpu, cuda, migraphx, openvino, webgpu */
+    std::string id;       /* auto, cpu, cuda, openvino */
     std::string ort_name; /* CPUExecutionProvider, ... */
     bool runtime_present = false;
 };
 
-/* CPU is always listed. Other rows are listed only when the linked
+/* Automatic and CPU are always listed. Other rows are listed only when the linked
  * ONNX Runtime reports them. With ONNX Runtime not linked, CPU is
  * listed and runtime_present is false. */
 std::vector<ExecProviderInfo> execution_provider_catalog();
@@ -39,7 +38,7 @@ struct OnnxProviderConfig {
     int dimension = 0;
     int max_tokens = 256;
     std::string pooling;            /* mean */
-    std::string execution_provider; /* cpu, cuda, migraphx, openvino, webgpu */
+    std::string execution_provider = "auto"; /* auto, cpu, cuda, openvino */
 };
 
 std::unique_ptr<EmbeddingProvider> make_onnx_provider(const OnnxProviderConfig &config,

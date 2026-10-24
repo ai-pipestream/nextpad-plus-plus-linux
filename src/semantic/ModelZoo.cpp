@@ -176,6 +176,12 @@ bool ModelZoo::load_file(const std::string &path, std::string &error)
             error = "model entry is missing a required field";
             return false;
         }
+        const Json *profile = entry.field("heatmap_profile");
+        if (profile && (profile->type != Json::Type::String ||
+                        !SemanticHeatmap::profileFromID(profile->str, spec.heatmap_profile))) {
+            error = "unknown heatmap profile";
+            return false;
+        }
         spec.id = id->str;
         spec.name = name->str;
         spec.dimension = dim ? dim->as_int(0) : 0;

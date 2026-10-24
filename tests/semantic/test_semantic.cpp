@@ -171,11 +171,21 @@ void test_colors()
     expect(high == 0x458A0Bu, "score 1 color");
     expect((low & 255) > (high & 255), "low score is redder");
     expect(((high >> 8) & 255) > ((low >> 8) & 255), "high score is greener");
-    expect(SemanticHeatmap::colorBGR(0.8, -1) != SemanticHeatmap::colorBGR(0.8, 1),
+    uint32_t strict = SemanticHeatmap::colorBGR(0.40, -1);
+    uint32_t standard = SemanticHeatmap::colorBGR(0.40, 0);
+    uint32_t broad = SemanticHeatmap::colorBGR(0.40, 1);
+    expect(strict != standard && standard != broad && strict != broad,
            "sensitivity changes the ramp");
-    expect(SemanticHeatmap::bandForScore(0.35) == 0, "band 0.35");
-    expect(SemanticHeatmap::bandForScore(0.72) == 2, "band 0.72");
-    expect(SemanticHeatmap::bandForScore(0.93) == 5, "band 0.93");
+    uint32_t unrelated = SemanticHeatmap::colorBGR(0.05);
+    uint32_t related = SemanticHeatmap::colorBGR(0.32);
+    uint32_t paraphrase = SemanticHeatmap::colorBGR(0.50);
+    expect(unrelated != related && related != paraphrase && unrelated != paraphrase,
+           "ramp is graded across the model range");
+    expect((unrelated & 255) > (paraphrase & 255), "paraphrase is less red");
+    expect(((paraphrase >> 8) & 255) > ((unrelated >> 8) & 255), "paraphrase is greener");
+    expect(SemanticHeatmap::bandForScore(0.10) == 0, "band 0.10");
+    expect(SemanticHeatmap::bandForScore(0.28) == 2, "band 0.28");
+    expect(SemanticHeatmap::bandForScore(0.58) == 5, "band 0.58");
     expect(SemanticHeatmap::bandForScore(std::nan("")) == -1, "nan band");
     expect(SemanticHeatmap::colorBGR(std::nan("")) == 0x8E8E8Eu, "nan color");
 }

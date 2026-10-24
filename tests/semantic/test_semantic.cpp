@@ -1,0 +1,457 @@
+/*
+ * Tokenizer, heatmap, sentence, index, manifest, and embedding checks.
+ * Embedding numbers run only when ONNX Runtime is linked and the model
+ * files named below are present. Pass --bench to print int8 throughput.
+ */
+#include "ExecutionProviders.h"
+#include "ModelZoo.h"
+#include "SemanticHeatmapColors.h"
+#include "SemanticInterfaces.h"
+#include "SentenceSplitter.h"
+#include "WordPieceTokenizer.h"
+
+#include <glib.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#ifndef SEMANTIC_FIXTURE_DIR
+#define SEMANTIC_FIXTURE_DIR "tests/fixtures/semantic"
+#endif
+#ifndef SEMANTIC_MANIFEST
+#define SEMANTIC_MANIFEST "resources/semantic/models.json"
+#endif
+#ifndef SEMANTIC_MODEL_DIR
+#define SEMANTIC_MODEL_DIR ""
+#endif
+
+namespace {
+
+int g_fails = 0;
+
+void expect(bool ok, const std::string &msg)
+{
+    if (ok) return;
+    std::cerr << "FAIL " << msg << "\n";
+    ++g_fails;
+}
+
+struct Record {
+    std::string text;
+    std::vector<int> ids;
+    std::vector<float> vec;
+};
+
+bool read_records(const std::string &path, std::vector<Record> &out, bool want_vec, std::string &error)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = "cannot open " + path;
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("TEXT ", 0) != 0) {
+            error = "expected TEXT in " + path + ": " + line;
+            return false;
+        }
+        size_t nbytes = static_cast<size_t>(std::stoul(line.substr(5)));
+        Record rec;
+        rec.text.resize(nbytes);
+        if (nbytes && !in.read(rec.text.data(), static_cast<std::streamsize>(nbytes))) {
+            error = "short TEXT payload in " + path;
+            return false;
+        }
+        int sep = in.get();
+        if (sep != '\n') {
+            error = "missing newline after TEXT payload in " + path;
+            return false;
+        }
+        if (!std::getline(in, line)) {
+            error = "missing IDS/VEC in " + path;
+            return false;
+        }
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (want_vec) {
+            if (line.rfind("VEC ", 0) != 0) {
+                error = "expected VEC in " + path;
+                return false;
+            }
+            int n = std::stoi(line.substr(4));
+            if (!std::getline(in, line)) {
+                error = "missing vector line";
+                return false;
+            }
+            std::istringstream ss(line);
+            float v;
+            while (ss >> v) rec.vec.push_back(v);
+            if (static_cast<int>(rec.vec.size()) != n) {
+                error = "vector width mismatch";
+                return false;
+            }
+        } else {
+            if (line.rfind("IDS ", 0) != 0) {
+                error = "expected IDS in " + path;
+                return false;
+            }
+            int n = std::stoi(line.substr(4));
+            if (!std::getline(in, line)) {
+                error = "missing id line";
+                return false;
+            }
+            std::istringstream ss(line);
+            int id;
+            while (ss >> id) rec.ids.push_back(id);
+            if (static_cast<int>(rec.ids.size()) != n) {
+                error = "id count mismatch";
+                return false;
+            }
+        }
+        out.push_back(std::move(rec));
+    }
+    if (out.empty()) {
+        error = "no records in " + path;
+        return false;
+    }
+    return true;
+}
+
+double cosine(const std::vector<float> &a, const std::vector<float> &b)
+{
+    double dot = 0, na = 0, nb = 0;
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        dot += static_cast<double>(a[i]) * b[i];
+        na += static_cast<double>(a[i]) * a[i];
+        nb += static_cast<double>(b[i]) * b[i];
+    }
+    if (na <= 0 || nb <= 0) return 0;
+    return dot / std::sqrt(na * nb);
+}
+
+void test_tokens()
+{
+    WordPieceTokenizer tok;
+    std::string error;
+    expect(tok.load(std::string(SEMANTIC_FIXTURE_DIR) + "/vocab.txt", error), error);
+    std::vector<Record> recs;
+    expect(read_records(std::string(SEMANTIC_FIXTURE_DIR) + "/golden_tokens.txt", recs, false, error), error);
+    for (size_t i = 0; i < recs.size(); ++i) {
+        std::vector<int32_t> ids;
+        bool ok = tok.encode(recs[i].text, 256, ids);
+        expect(ok, "encode failed on record " + std::to_string(i));
+        if (!ok) continue;
+        bool same = ids.size() == recs[i].ids.size();
+        for (size_t k = 0; same && k < ids.size(); ++k)
+            same = ids[k] == recs[i].ids[k];
+        if (!same) {
+            std::ostringstream msg;
+            msg << "token mismatch on record " << i << " text bytes " << recs[i].text.size()
+                << " got";
+            for (int id : ids) msg << " " << id;
+            expect(false, msg.str());
+        }
+    }
+}
+
+void test_colors()
+{
+    uint32_t low = SemanticHeatmap::colorBGR(0.0);
+    uint32_t high = SemanticHeatmap::colorBGR(1.0);
+    expect(low == 0x4145D6u, "score 0 color");
+    expect(high == 0x458A0Bu, "score 1 color");
+    expect((low & 255) > (high & 255), "low score is redder");
+    expect(((high >> 8) & 255) > ((low >> 8) & 255), "high score is greener");
+    expect(SemanticHeatmap::colorBGR(0.8, -1) != SemanticHeatmap::colorBGR(0.8, 1),
+           "sensitivity changes the ramp");
+    expect(SemanticHeatmap::bandForScore(0.35) == 0, "band 0.35");
+    expect(SemanticHeatmap::bandForScore(0.72) == 2, "band 0.72");
+    expect(SemanticHeatmap::bandForScore(0.93) == 5, "band 0.93");
+    expect(SemanticHeatmap::bandForScore(std::nan("")) == -1, "nan band");
+    expect(SemanticHeatmap::colorBGR(std::nan("")) == 0x8E8E8Eu, "nan color");
+}
+
+void test_sentences()
+{
+    auto spans = split_sentences("One sentence. Two sentences.");
+    expect(spans.size() >= 2, "two sentences");
+    int64_t prev = -1;
+    for (const SentenceSpan &s : spans) {
+        expect(s.byte_start >= 0, "start");
+        expect(s.byte_length > 0, "length");
+        expect(s.byte_start > prev, "ordered");
+        expect(static_cast<size_t>(s.byte_start + s.byte_length) <= std::strlen("One sentence. Two sentences."),
+               "in range");
+        prev = s.byte_start;
+    }
+    expect(split_sentences("   \n\t  ").empty(), "blank");
+    expect(split_sentences("").empty(), "empty");
+    expect(split_sentences("\xff").empty(), "bad utf-8");
+    auto one = split_sentences("Cafe.");
+    expect(one.size() == 1, "single sentence");
+    if (one.size() == 1) {
+        expect(one[0].byte_start == 0, "single starts at 0");
+        expect(one[0].byte_length == 5, "single covers Cafe.");
+    }
+}
+
+void test_index()
+{
+    auto engine = make_cpu_similarity_engine();
+    auto index = make_memory_vector_index(*engine);
+    index->reset(2);
+    float a[] = {1.f, 0.f};
+    float b[] = {0.f, 1.f};
+    float c[] = {0.6f, 0.8f};
+    expect(index->add(a, 10), "add a");
+    expect(index->add(b, 11), "add b");
+    expect(index->add(c, 12), "add c");
+    SemanticHit hits[3];
+    size_t n = index->score_all(a, hits, 3);
+    expect(n == 3, "score count");
+    if (n == 3) {
+        expect(hits[0].sentence_id == 10 && std::fabs(hits[0].score - 1.f) < 1e-5, "score a");
+        expect(hits[1].sentence_id == 11 && std::fabs(hits[1].score) < 1e-5, "score b");
+        expect(hits[2].sentence_id == 12 && std::fabs(hits[2].score - 0.6f) < 1e-5, "score c");
+    }
+    SemanticHit top[1];
+    expect(index->search(a, 1, top) == 1 && top[0].sentence_id == 10, "top hit");
+}
+
+void test_manifest()
+{
+    ModelZoo zoo;
+    std::string error;
+    expect(zoo.load_file(SEMANTIC_MANIFEST, error), error.empty() ? "manifest" : error);
+    expect(zoo.default_id() == "all-MiniLM-L6-v2", "default id");
+    expect(zoo.models().size() == 3, "three models");
+    const ModelSpec *spec = zoo.find("all-MiniLM-L6-v2");
+    expect(spec != nullptr, "default spec");
+    if (!spec) return;
+    expect(spec->dimension == 384, "dim");
+    expect(spec->pooling == "mean", "pooling");
+    expect(spec->max_tokens == 256, "max tokens");
+    expect(spec->vocab.sha256.size() == 64, "vocab sha");
+    expect(spec->model.sha256.size() == 64, "model sha");
+    expect(!spec->model.filename.empty(), "arch file");
+    expect(zoo.find("missing") == nullptr, "unknown id");
+
+    std::string hex;
+    std::string vocab = std::string(SEMANTIC_FIXTURE_DIR) + "/vocab.txt";
+    expect(ModelZoo::file_sha256(vocab, hex, error), "hash vocab");
+    gchar *dir = g_dir_make_tmp("npp-sem-XXXXXX", nullptr);
+    expect(dir != nullptr, "tmp dir");
+    if (!dir) return;
+    std::string dest_vocab = std::string(dir) + "/vocab.txt";
+    std::string dest_model = std::string(dir) + "/model.onnx";
+    {
+        std::ifstream in(vocab, std::ios::binary);
+        std::ofstream out1(dest_vocab, std::ios::binary);
+        std::ofstream out2(dest_model, std::ios::binary);
+        out1 << in.rdbuf();
+        in.clear();
+        in.seekg(0);
+        out2 << in.rdbuf();
+    }
+    ModelSpec fake = *spec;
+    fake.vocab.filename = "vocab.txt";
+    fake.vocab.sha256 = hex;
+    fake.vocab.url = "http://127.0.0.1:9/missing-vocab";
+    fake.model.filename = "model.onnx";
+    fake.model.sha256 = hex;
+    fake.model.url = "http://127.0.0.1:9/missing-model";
+    std::string err2;
+    expect(zoo.ensure(fake, dir, err2), err2.empty() ? "ensure cache hit" : err2);
+    g_free(dir);
+}
+
+void test_providers()
+{
+    std::string error;
+    auto turbo = make_turboembed_provider(error);
+    expect(!turbo && error.find("TurboEmbed") != std::string::npos, error);
+    auto cat = execution_provider_catalog();
+    bool saw_cpu = false;
+    for (const ExecProviderInfo &ep : cat) {
+        if (ep.id == "cpu") {
+            saw_cpu = true;
+#if NPP_HAVE_ONNXRUNTIME
+            expect(ep.runtime_present, "cpu present");
+#else
+            expect(!ep.runtime_present, "cpu absent without ORT");
+#endif
+        }
+    }
+    expect(saw_cpu, "catalog lists cpu");
+#if !NPP_HAVE_ONNXRUNTIME
+    OnnxProviderConfig cfg;
+    cfg.dimension = 384;
+    cfg.max_tokens = 256;
+    cfg.pooling = "mean";
+    auto missing = make_onnx_provider(cfg, error);
+    expect(!missing && error.find("not linked") != std::string::npos, error);
+#endif
+}
+
+#if NPP_HAVE_ONNXRUNTIME
+
+std::string model_dir()
+{
+    const char *env = std::getenv("NPP_SEMANTIC_TEST_MODEL_DIR");
+    if (env && *env) return env;
+    return SEMANTIC_MODEL_DIR;
+}
+
+bool file_ok(const std::string &path)
+{
+    return g_file_test(path.c_str(), G_FILE_TEST_IS_REGULAR);
+}
+
+void compare_model(const std::string &model_path, const std::string &golden_path,
+                   int max_tokens, double floor_all, double floor_short, const char *label)
+{
+    std::string dir = model_dir();
+    std::string vocab = dir + "/vocab.txt";
+    if (dir.empty() || !file_ok(model_path) || !file_ok(vocab) || !file_ok(golden_path)) {
+        std::cout << "skip " << label << " (model or golden missing)\n";
+        return;
+    }
+    OnnxProviderConfig cfg;
+    cfg.model_path = model_path;
+    cfg.vocab_path = vocab;
+    cfg.dimension = 384;
+    cfg.max_tokens = max_tokens;
+    cfg.pooling = "mean";
+    cfg.execution_provider = "cpu";
+    std::string error;
+    auto provider = make_onnx_provider(cfg, error);
+    expect(provider != nullptr, error.empty() ? std::string("load ") + label : error);
+    if (!provider) return;
+    std::vector<Record> gold;
+    expect(read_records(golden_path, gold, true, error), error);
+    if (!error.empty() && gold.empty()) return;
+    /* One text per call. The int8 graph moves when a batch pads shorter
+     * sequences up to a longer neighbour, so the fixture is unpadded. */
+    for (size_t i = 0; i < gold.size(); ++i) {
+        std::vector<float> got;
+        expect(provider->embed_batch({gold[i].text}, got, error, {}),
+               error.empty() ? "embed" : error);
+        if (got.size() != 384) {
+            expect(false, "embedding width");
+            return;
+        }
+        double c = cosine(got, gold[i].vec);
+        double floor = gold[i].text.size() < 200 ? floor_short : floor_all;
+        if (c < floor) {
+            std::ostringstream msg;
+            msg << label << " cosine " << c << " on record " << i
+                << " (" << gold[i].text.size() << " bytes), floor " << floor;
+            expect(false, msg.str());
+        }
+    }
+}
+
+void test_embeddings()
+{
+    std::string dir = model_dir();
+    compare_model(dir + "/model_fp32.onnx",
+                  std::string(SEMANTIC_FIXTURE_DIR) + "/golden_st.txt",
+                  256, 0.999, 0.999, "fp32 vs sentence-transformers");
+    compare_model(dir + "/model_quint8_avx2.onnx",
+                  std::string(SEMANTIC_FIXTURE_DIR) + "/golden_int8.txt",
+                  256, 0.999, 0.999, "int8 vs ort reference");
+    compare_model(dir + "/model_quint8_avx2.onnx",
+                  std::string(SEMANTIC_FIXTURE_DIR) + "/golden_st.txt",
+                  256, 0.93, 0.97, "int8 vs sentence-transformers");
+}
+
+int bench()
+{
+    std::string dir = model_dir();
+    std::string model = dir + "/model_quint8_avx2.onnx";
+    std::string vocab = dir + "/vocab.txt";
+    if (!file_ok(model) || !file_ok(vocab)) {
+        std::cerr << "bench needs int8 model and vocab in " << dir << "\n";
+        return 1;
+    }
+    OnnxProviderConfig cfg;
+    cfg.model_path = model;
+    cfg.vocab_path = vocab;
+    cfg.dimension = 384;
+    cfg.max_tokens = 256;
+    cfg.pooling = "mean";
+    cfg.execution_provider = "cpu";
+    std::string error;
+    auto provider = make_onnx_provider(cfg, error);
+    if (!provider) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+    const char *samples[] = {
+        "The cat sat on the mat.",
+        "Machine learning models embed text.",
+        "A completely unrelated remark about the weather in Oslo.",
+        "Semantic search finds sentences with similar meaning.",
+        "Short note about the river bank.",
+    };
+    std::vector<std::string> texts;
+    for (int i = 0; i < 100; ++i)
+        texts.push_back(std::string(samples[i % 5]) + " item " + std::to_string(i));
+    std::vector<float> warm;
+    if (!provider->embed_batch({texts[0]}, warm, error, {})) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+    std::vector<float> out;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!provider->embed_batch(texts, out, error, {})) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    std::cout << "int8 throughput: " << (texts.size() / sec)
+              << " sentences/sec (" << texts.size() << " sentences, " << sec
+              << " s, batch 8, intra-op threads 2, after one warmup sentence)\n";
+    return 0;
+}
+
+#endif /* NPP_HAVE_ONNXRUNTIME */
+
+} /* namespace */
+
+int main(int argc, char **argv)
+{
+    bool do_bench = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--bench") == 0) do_bench = true;
+
+    test_tokens();
+    test_colors();
+    test_sentences();
+    test_index();
+    test_manifest();
+    test_providers();
+#if NPP_HAVE_ONNXRUNTIME
+    if (do_bench) return bench();
+    test_embeddings();
+#else
+    (void)do_bench;
+    std::cout << "skip embeddings (ONNX Runtime not linked)\n";
+#endif
+    if (g_fails) {
+        std::cerr << g_fails << " failure(s)\n";
+        return 1;
+    }
+    std::cout << "ok\n";
+    return 0;
+}

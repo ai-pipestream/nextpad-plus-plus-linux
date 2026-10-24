@@ -3,6 +3,10 @@
 %:
 	dh $@ --buildsystem=cmake
 
+# Semantic search links ONNX Runtime only when cmake finds it
+# (ONNXRUNTIME_ROOT or a system libonnxruntime). These packages do not
+# depend on it and do not bundle weights. Pass -DNPP_WITH_ONNXRUNTIME=OFF
+# to build the editor with embeddings disabled.
 override_dh_auto_configure:
 	dh_auto_configure -- \
 		-DCMAKE_BUILD_TYPE=Release \

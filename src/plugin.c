@@ -689,12 +689,24 @@ long plugin_host_message(unsigned int msg, unsigned long wParam, long lParam)
         return 1;
     }
     case NPPM_ALLOCATEINDICATOR: {
-        /* wParam = count; lParam = int * base */
+        /* wParam = count; lParam = int * base.
+         * Indicator 20 is the semantic-search heatmap. A request that
+         * would include it starts at 21 instead, when that still fits. */
         int *out = (int *)(intptr_t)lParam;
-        if (!out) return 0;
-        if (s_next_indicator + (int)wParam > 31) return 0; /* range exhausted */
-        *out = s_next_indicator;
-        s_next_indicator += (int)wParam;
+        int count = (int)wParam;
+        if (!out || count < 1) return 0;
+        int start = s_next_indicator;
+        if (start == 20)
+            start = 21;
+        if (start < 20 && start + count > 20) {
+            if (21 + count > 31) return 0;
+            start = 21;
+        }
+        if (start + count > 31) return 0; /* range exhausted */
+        *out = start;
+        s_next_indicator = start + count;
+        if (s_next_indicator == 20)
+            s_next_indicator = 21;
         return 1;
     }
     case NPPM_ALLOCATEMARKER: {

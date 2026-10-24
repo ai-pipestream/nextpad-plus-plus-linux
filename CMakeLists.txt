@@ -22,6 +22,37 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK4 REQUIRED gtk4)
 pkg_check_modules(ADW  REQUIRED libadwaita-1)
 pkg_check_modules(UCHARDET REQUIRED uchardet)   # GAP-57 CJK detection
+pkg_check_modules(GLIB2 REQUIRED glib-2.0)
+pkg_check_modules(PANGO REQUIRED pango)
+find_package(Threads REQUIRED)
+
+# Semantic search embeddings. ONNX Runtime is optional: without it the
+# editor still builds and the search bar reports that embeddings are off.
+# Weights are not part of the package; the app downloads them on first use.
+option(NPP_WITH_ONNXRUNTIME "Link ONNX Runtime for semantic search" ON)
+option(NPP_BUNDLE_ONNXRUNTIME "Install libonnxruntime into the private lib dir" OFF)
+set(ONNXRUNTIME_ROOT "" CACHE PATH "ONNX Runtime prefix (include/ and lib/)")
+set(NPP_SEMANTIC_TEST_MODEL_DIR "" CACHE PATH
+    "Directory with MiniLM ONNX files for semantic tests")
+
+set(NPP_HAVE_ONNXRUNTIME 0)
+if(NPP_WITH_ONNXRUNTIME)
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_c_api.h
+        HINTS "${ONNXRUNTIME_ROOT}/include" "$ENV{ONNXRUNTIME_ROOT}/include"
+              /opt/onnxruntime/include /usr/include /usr/local/include)
+    find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
+        HINTS "${ONNXRUNTIME_ROOT}/lib" "${ONNXRUNTIME_ROOT}/lib64"
+              "$ENV{ONNXRUNTIME_ROOT}/lib" "$ENV{ONNXRUNTIME_ROOT}/lib64"
+              /opt/onnxruntime/lib /usr/lib /usr/local/lib)
+    if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
+        set(NPP_HAVE_ONNXRUNTIME 1)
+        message(STATUS "ONNX Runtime: ${ONNXRUNTIME_LIBRARY}")
+    else()
+        message(STATUS "ONNX Runtime not found; semantic search embeddings disabled")
+    endif()
+else()
+    message(STATUS "ONNX Runtime disabled by NPP_WITH_ONNXRUNTIME=OFF")
+endif()
 
 set(SCI_ROOT "${CMAKE_SOURCE_DIR}/scintilla")
 set(LEX_ROOT "${CMAKE_SOURCE_DIR}/lexilla")
@@ -102,6 +133,30 @@ set_source_files_properties("${LEX_ROOT}/lexers/LexSearchResult.cxx" PROPERTIES
     COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/vendor/SearchResultMarkings.h")
 
 # -----------------------------------------------------------------------------
+# Semantic search core (C++). The GTK bar lives in the app target.
+# -----------------------------------------------------------------------------
+add_library(npp_semantic STATIC
+    "${SRC}/semantic/JsonMini.cpp"
+    "${SRC}/semantic/WordPieceTokenizer.cpp"
+    "${SRC}/semantic/SentenceSplitter.cpp"
+    "${SRC}/semantic/CpuSimilarityEngine.cpp"
+    "${SRC}/semantic/OnnxEmbeddingProvider.cpp"
+    "${SRC}/semantic/ModelZoo.cpp"
+)
+target_include_directories(npp_semantic PUBLIC
+    "${SRC}/semantic"
+    ${GLIB2_INCLUDE_DIRS} ${PANGO_INCLUDE_DIRS}
+)
+target_compile_definitions(npp_semantic PUBLIC NPP_HAVE_ONNXRUNTIME=${NPP_HAVE_ONNXRUNTIME})
+target_compile_options(npp_semantic PRIVATE ${GLIB2_CFLAGS_OTHER} ${PANGO_CFLAGS_OTHER})
+target_link_directories(npp_semantic PUBLIC ${GLIB2_LIBRARY_DIRS} ${PANGO_LIBRARY_DIRS})
+target_link_libraries(npp_semantic PUBLIC ${GLIB2_LIBRARIES} ${PANGO_LIBRARIES} Threads::Threads)
+if(NPP_HAVE_ONNXRUNTIME)
+    target_include_directories(npp_semantic PUBLIC "${ONNXRUNTIME_INCLUDE_DIR}")
+    target_link_libraries(npp_semantic PUBLIC "${ONNXRUNTIME_LIBRARY}")
+endif()
+
+# -----------------------------------------------------------------------------
 # Application — nextpad-plus-plus
 # -----------------------------------------------------------------------------
 set(APP_SRCS
@@ -109,6 +164,7 @@ set(APP_SRCS
     "${SRC}/main.c"
     "${SRC}/lexilla_bridge.cpp"
     "${SRC}/fuzzy_bridge.cpp"
+    "${SRC}/semantic_search.cpp"
     "${CMAKE_SOURCE_DIR}/fuzzy/FuzzyMatcher.cxx"
     "${CMAKE_SOURCE_DIR}/fuzzy/FuzzyText.cxx"
     "${SRC}/recent.c"
@@ -192,6 +248,7 @@ add_dependencies(nextpad_pp scintilla_build)
 
 target_include_directories(nextpad_pp PRIVATE
     "${SRC}"
+    "${SRC}/semantic"
     "${SCI_ROOT}/include" "${SCI_ROOT}/gtk4"
     "${LEX_ROOT}/include"
     "${CMAKE_SOURCE_DIR}/regex"
@@ -230,13 +287,20 @@ set_source_files_properties("${SRC}/lexilla_bridge.cpp" PROPERTIES
 # directory found via a RELOCATABLE $ORIGIN rpath, which resolves identically
 # on every distro and under any CMAKE_INSTALL_PREFIX. This also stops the
 # developer's absolute build path from being baked into shipped binaries.
+if(NPP_HAVE_ONNXRUNTIME)
+    get_filename_component(_ort_libdir "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
+    set(_npp_build_rpath "${SCI_ROOT}/bin;${_ort_libdir}")
+else()
+    set(_npp_build_rpath "${SCI_ROOT}/bin")
+endif()
 set_target_properties(nextpad_pp PROPERTIES
-    BUILD_RPATH   "${SCI_ROOT}/bin"
+    BUILD_RPATH   "${_npp_build_rpath}"
     INSTALL_RPATH "$ORIGIN/../lib/nextpad-plus-plus")
 
 target_link_libraries(nextpad_pp PRIVATE
     "${SCI_SO}"
     lexilla
+    npp_semantic
     ${GTK4_LIBRARIES} ${ADW_LIBRARIES} ${UCHARDET_LIBRARIES}
     m
 )
@@ -262,6 +326,12 @@ install(CODE "
 # above): a plain "lib/nextpad-plus-plus" is valid on both Debian- and
 # RPM-family layouts, and the $ORIGIN rpath points straight at it.
 install(FILES "${SCI_SO}" DESTINATION lib/nextpad-plus-plus)
+# Optional. Default packages do not ship libonnxruntime or model weights.
+# Turn this on only for a build that should carry the .so it linked.
+if(NPP_BUNDLE_ONNXRUNTIME AND NPP_HAVE_ONNXRUNTIME)
+    get_filename_component(_ort_real "${ONNXRUNTIME_LIBRARY}" REALPATH)
+    install(FILES "${_ort_real}" DESTINATION lib/nextpad-plus-plus)
+endif()
 # Install the contents of resources/ directly under .../nextpad-plus-plus
 # so the tree matches RESOURCES_DIR (= NPP_RES_DIR) baked into the binary.
 install(DIRECTORY resources/ DESTINATION ${CMAKE_INSTALL_DATADIR}/nextpad-plus-plus
@@ -295,3 +365,18 @@ install(FILES packaging/apparmor/nextpad-plus-plus
 install(DIRECTORY resources/icons/hicolor/
         DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor
         FILES_MATCHING PATTERN "nextpad-plus-plus.*")
+
+enable_testing()
+add_executable(npp_semantic_tests "${CMAKE_SOURCE_DIR}/tests/semantic/test_semantic.cpp")
+target_link_libraries(npp_semantic_tests PRIVATE npp_semantic)
+target_compile_definitions(npp_semantic_tests PRIVATE
+    SEMANTIC_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/semantic"
+    SEMANTIC_MANIFEST="${CMAKE_SOURCE_DIR}/resources/semantic/models.json"
+    SEMANTIC_MODEL_DIR="${NPP_SEMANTIC_TEST_MODEL_DIR}"
+)
+if(NPP_HAVE_ONNXRUNTIME)
+    get_filename_component(_ort_libdir "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
+    set_target_properties(npp_semantic_tests PROPERTIES
+        BUILD_RPATH "${_ort_libdir}")
+endif()
+add_test(NAME semantic COMMAND npp_semantic_tests)

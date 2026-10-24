@@ -206,11 +206,30 @@ void test_sentences()
     expect(split_sentences("   \n\t  ").empty(), "blank");
     expect(split_sentences("").empty(), "empty");
     expect(split_sentences("\xff").empty(), "bad utf-8");
-    auto one = split_sentences("Cafe.");
+    expect(!segment_has_content("1."), "bare number");
+    expect(!segment_has_content("- "), "list dash");
+    expect(!segment_has_content("***"), "stars");
+    expect(!segment_has_content("42)"), "digits");
+    expect(!segment_has_content("•"), "bullet");
+    expect(segment_has_content("Backup generator failed"), "real phrase");
+    expect(split_sentences("1.").empty(), "number dropped");
+    expect(split_sentences("- ").empty(), "dash dropped");
+    expect(split_sentences("***").empty(), "stars dropped");
+    auto kept = split_sentences("Backup generator failed");
+    expect(kept.size() == 1, "phrase kept");
+    auto listed = split_sentences("1.\n2.\n- \n***\nBackup generator failed.");
+    bool saw_phrase = false;
+    for (const SentenceSpan &s : listed) {
+        expect(segment_has_content(s.text), "listed span has words");
+        if (s.text.find("Backup generator failed") != std::string::npos)
+            saw_phrase = true;
+    }
+    expect(saw_phrase, "phrase survives a list");
+    auto one = split_sentences("Good coffee.");
     expect(one.size() == 1, "single sentence");
     if (one.size() == 1) {
         expect(one[0].byte_start == 0, "single starts at 0");
-        expect(one[0].byte_length == 5, "single covers Cafe.");
+        expect(one[0].byte_length == 12, "single covers Good coffee.");
     }
 }
 

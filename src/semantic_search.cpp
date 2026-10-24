@@ -157,6 +157,7 @@ struct Controller {
             gtk_widget_set_tooltip_text(status, text.c_str());
         }
         if (spinner) {
+            gtk_widget_set_visible(spinner, busy);
             if (busy) gtk_spinner_start(GTK_SPINNER(spinner));
             else gtk_spinner_stop(GTK_SPINNER(spinner));
         }
@@ -539,12 +540,15 @@ struct Controller {
                 }
                 char buf[256];
                 if (done) {
-                    std::snprintf(buf, sizeof buf, "%u of %u sentences indexed · %s",
-                                  static_cast<unsigned>(n_embedded),
-                                  static_cast<unsigned>(total),
-                                  backend.c_str());
+                    std::string model_label = loaded_model;
+                    if (const ModelSpec *spec = zoo.find(loaded_model)) {
+                        if (!spec->name.empty()) model_label = spec->name;
+                    }
+                    index_status = std::to_string(n_embedded) + " of " +
+                                   std::to_string(total) +
+                                   " sentences indexed · " + model_label +
+                                   " · " + backend;
                     index_ready = true;
-                    index_status = buf;
                     set_status(index_status, false);
                     if (!query.empty()) run_query();
                 } else {
@@ -736,7 +740,10 @@ GtkWidget *semantic_search_bar_new(void)
 
     GtkWidget *label = gtk_label_new("Semantic:");
     c.entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(c.entry), "Describe what you're looking for");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(c.entry), "Describe what you're looking for…");
+    gtk_accessible_update_property(GTK_ACCESSIBLE(c.entry),
+                                   GTK_ACCESSIBLE_PROPERTY_LABEL,
+                                   "Semantic search query", -1);
     gtk_widget_set_hexpand(c.entry, TRUE);
     g_signal_connect(c.entry, "changed", G_CALLBACK(on_entry_changed), nullptr);
     GtkEventController *keys = gtk_event_controller_key_new();
@@ -805,7 +812,11 @@ GtkWidget *semantic_search_bar_new(void)
         std::snprintf(cls, sizeof cls, "sem-band-%d", i);
         gtk_widget_add_css_class(c.swatch[i], cls);
         gtk_widget_set_tooltip_text(c.swatch[i],
-            "Show this similarity band and bookmark its lines. Click again to clear. Several bands can be selected.");
+            "Show only the selected similarity bands and bookmark their lines. Click again to deselect. Several bands can be selected.");
+        char alabel[64];
+        std::snprintf(alabel, sizeof alabel, "Similarity band %d of 6", i + 1);
+        gtk_accessible_update_property(GTK_ACCESSIBLE(c.swatch[i]),
+                                       GTK_ACCESSIBLE_PROPERTY_LABEL, alabel, -1);
         g_object_set_data(G_OBJECT(c.swatch[i]), "band", GINT_TO_POINTER(i));
         g_signal_connect(c.swatch[i], "toggled", G_CALLBACK(on_swatch), nullptr);
         gtk_box_append(GTK_BOX(swatches), c.swatch[i]);

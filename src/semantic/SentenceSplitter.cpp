@@ -5,21 +5,31 @@
 
 #include <vector>
 
-namespace {
-
-bool is_blank(const std::string &s)
+bool segment_has_content(const std::string &utf8)
 {
-    const char *p = s.data();
-    const char *end = p + s.size();
+    /* List markers ("1.", "- ", "***") have nothing to compare with a
+     * query. Two letter-words is the smallest span that does. */
+    if (utf8.empty() ||
+        !g_utf8_validate(utf8.data(), static_cast<gssize>(utf8.size()), nullptr))
+        return false;
+    int words = 0;
+    bool in_word = false;
+    const char *p = utf8.data();
+    const char *end = p + utf8.size();
     while (p < end && *p) {
         gunichar c = g_utf8_get_char(p);
-        if (!g_unichar_isspace(c)) return false;
+        if (g_unichar_isalpha(c)) {
+            if (!in_word) {
+                in_word = true;
+                if (++words >= 2) return true;
+            }
+        } else {
+            in_word = false;
+        }
         p = g_utf8_next_char(p);
     }
-    return true;
+    return false;
 }
-
-} /* namespace */
 
 std::vector<SentenceSpan> split_sentences(const std::string &utf8)
 {
@@ -65,7 +75,7 @@ std::vector<SentenceSpan> split_sentences(const std::string &utf8)
         if (b1 < b0) continue;
         std::string slice = utf8.substr(static_cast<size_t>(b0),
                                         static_cast<size_t>(b1 - b0));
-        if (is_blank(slice)) continue;
+        if (!segment_has_content(slice)) continue;
         SentenceSpan span;
         span.byte_start = b0;
         span.byte_length = b1 - b0;

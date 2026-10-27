@@ -272,6 +272,23 @@ void test_stale_query_colours()
            "a result after shutdown changed the heatmap");
 }
 
+void test_job_ticket_survives_download_boundaries()
+{
+    CancellableSpawn spawn;
+    auto queued = spawn.ticket();
+    spawn.cancel();
+    auto old = spawn.run({"sleep", "30"}, queued);
+    expect(old.cancelled && !old.started, "cancel before worker begins must stick to queued ticket");
+    auto current = spawn.ticket();
+    auto vocab = spawn.run({"true"}, current);
+    expect(vocab.exited && vocab.exit_code == 0, "new job may download vocabulary");
+    spawn.cancel();
+    auto model = spawn.run({"sleep", "30"}, current);
+    expect(model.cancelled && !model.started, "cancel between vocabulary and model must prevent second child");
+    auto fresh = spawn.run({"true"}, spawn.ticket());
+    expect(fresh.exited && fresh.exit_code == 0, "fresh ticket still runs");
+}
+
 } /* namespace */
 
 int main()
@@ -280,6 +297,7 @@ int main()
     test_quit_during_embed();
     test_on_stop_runs_on_worker();
     test_cancel_before_lock();
+    test_job_ticket_survives_download_boundaries();
     test_stale_query_colours();
     if (g_fails) {
         std::cerr << g_fails << " failure(s)\n";

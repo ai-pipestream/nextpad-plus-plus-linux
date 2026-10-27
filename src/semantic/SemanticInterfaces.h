@@ -41,6 +41,9 @@ public:
     /* Status text, for example "ONNX Runtime CPU". */
     virtual std::string backend_name() const = 0;
 
+    /* Changes whenever vectors from an earlier backend become invalid. */
+    virtual uint64_t backend_generation() const { return 0; }
+
     /* Token count including the special tokens the model expects. */
     virtual size_t token_count(const std::string &text) const = 0;
 

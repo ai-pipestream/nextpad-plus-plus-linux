@@ -111,6 +111,7 @@ public:
     int max_tokens() const override { return max_tokens_; }
     bool available() const override { return ready_; }
     std::string backend_name() const override { return backend_; }
+    uint64_t backend_generation() const override { return backend_generation_; }
 
     size_t token_count(const std::string &text) const override
     {
@@ -141,6 +142,7 @@ private:
     std::string backend_;
     std::string model_path_;
     bool using_gpu_ = false;
+    uint64_t backend_generation_ = 0;
 };
 
 bool OnnxEmbeddingProvider::make_options(bool try_gpu, const KnownEp *want, std::string &error)
@@ -250,6 +252,7 @@ bool OnnxEmbeddingProvider::open(const OnnxProviderConfig &config, std::string &
 bool OnnxEmbeddingProvider::fallback_cpu(std::string &error)
 {
     using_gpu_ = false;
+    ++backend_generation_;
     if (ort_.session) ort_.api->ReleaseSession(ort_.session);
     ort_.session = nullptr;
     ort_.input_names.clear();

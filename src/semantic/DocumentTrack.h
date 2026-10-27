@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <set>
+#include <map>
 #include <vector>
 
 struct DocView {
@@ -67,6 +68,11 @@ private:
     std::vector<int> handles_;
 };
 
+struct MarkerSyncState {
+    std::map<int, int> last_lines;
+    std::set<int> dismissed_lines;
+};
+
 struct MarkerFns {
     std::function<int(int handle)> line_from_handle;
     std::function<void(int handle)> delete_handle;
@@ -76,10 +82,11 @@ struct MarkerFns {
 
 /* Keep `handles` aligned with `want_lines`. A handle whose line moved
  * stays put when that line is still wanted. A handle whose line was
- * deleted is dropped without deleting a different line. */
+ * deleted may move to its neighbour in Scintilla. Delete only owned handles.
+ * Remember explicitly removed markers until the selection is cleared. */
 void sync_marker_handles(std::vector<int> &handles,
                          const std::set<int> &want_lines,
                          unsigned bookmark_bit,
-                         const MarkerFns &fns);
+                         const MarkerFns &fns, MarkerSyncState *state = nullptr);
 
 #endif

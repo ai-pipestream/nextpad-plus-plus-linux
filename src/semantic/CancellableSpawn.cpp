@@ -29,15 +29,10 @@ void drain_fd(int fd, std::string &out)
 
 } /* namespace */
 
-CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &args)
+CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &args, Ticket ticket)
 {
     Result result;
-    /* Sample before any lock. A cancel() that arrives after this point,
-     * including one that arrives before the lock below, moves the
-     * generation and this run does not start. A cancel that already
-     * happened is part of the sample, so the next run is not stuck. */
-    const uint64_t ticket = cancel_gen_.load();
-    if (retired_.load()) {
+    if (cancelled(ticket)) {
         result.cancelled = true;
         return result;
     }

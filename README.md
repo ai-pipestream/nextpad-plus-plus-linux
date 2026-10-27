@@ -260,25 +260,31 @@ when the index is ready, `N of M sentences indexed · <model> · <backend>`, for
 example `29 of 29 sentences indexed · MiniLM-L6 fp32 · ONNX Runtime CPU`.
 Automatic on a CPU-only runtime shows `ONNX Runtime CPU`. The suffix
 `(GPU unavailable)` is added only when CUDA or OpenVINO was selected and that
-provider could not be used. After a GPU failure during indexing the backend
+provider could not be used. A backend generation change invalidates both the
+sentence cache and index, including fallback while embedding a new query.
+Scoring resumes after rebuilding sentence vectors on CPU. After a GPU failure the backend
 reads `ONNX Runtime CPU (GPU inference failed)`.
 
-If the selected model is not on disk, the status names its id and says it is
-not installed and that the download needs a network connection. If `curl` is
-missing, the same message says curl is required. A cancelled download does not
-replace the status text.
+The runtime is checked before any model download. Download errors name the
+model and distinguish connection, HTTP, TLS, timeout, and disk-write failures.
+If curl cannot start, the status asks you to check its installation. Cancellation
+covers the entire queued job, including both vocabulary and model downloads.
 
 Cloned views share one Scintilla document. An edit in either view refreshes
 the semantic index, and the heatmap is drawn on that shared document. Closing
 one of two clones leaves the heatmap and the bookmarks semantic search added.
 Closing the last view of the document removes only those bookmarks. Bookmarks
 are tracked by marker handle, so an edit that moves lines does not make a
-later removal delete a different line.
+later removal targets the owned marker. Scintilla may move a deleted line's
+marker to a neighbouring line; ownership follows the handle. Manually removed
+feature bookmarks stay removed during subsequent indexing batches, until the
+search selection is cleared or rebuilt.
 
 The heatmap indicator comes from the host indicator allocator
 (`NPPM_ALLOCATEINDICATOR`). The allocator starts at indicator 9 and skips
 indicator 9 (incremental search) and indicator 19 (clickable links), so the
-first slot it hands out is 10. It does not reserve indicator 20. The search
+first slot it hands out is 10. Allocation is capped at 20; higher slots belong
+to the editor (including Mark All at 31). Failed requests return output 0. The search
 bar is created before plugins load and takes that first slot. A plugin request
 that fits in the gaps around indicators 9 and 19 still succeeds.
 

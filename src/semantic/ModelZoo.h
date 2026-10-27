@@ -11,11 +11,11 @@
 #define NPP_MODEL_ZOO_H
 
 #include "SemanticHeatmapColors.h"
+#include "CancellableSpawn.h"
+#include <optional>
 
 #include <string>
 #include <vector>
-
-class CancellableSpawn;
 
 struct ModelFile {
     std::string filename;
@@ -45,16 +45,17 @@ public:
      * there under their filenames, with matching SHA-256. A file that is
      * already correct is not downloaded again. When spawn is set, an
      * in-flight download can be cancelled or the spawner can be retired
-     * so shutdown does not wait for curl's full timeout. */
+     * so shutdown does not wait for curl's full timeout. Queued jobs pass
+     * a ticket captured before enqueueing; both downloads use that ticket. */
     bool ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error,
-                CancellableSpawn *spawn = nullptr) const;
+                CancellableSpawn *spawn = nullptr,
+                std::optional<CancellableSpawn::Ticket> ticket = std::nullopt) const;
 
     static std::string host_arch();
     static bool file_sha256(const std::string &path, std::string &hex, std::string &error);
 
-    /* Status text when a model file is not on disk. `curl_missing` adds
-     * that curl is required. A cancelled download does not use this. */
-    static std::string download_failure_message(const std::string &model_id, bool curl_missing);
+    /* Concise download failure text, classified by curl exit code. */
+    static std::string download_failure_message(const std::string &model_id, bool curl_missing, int exit_code = -1);
 
 private:
     std::string default_id_;

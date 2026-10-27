@@ -1,14 +1,17 @@
 #include "semantic_search.h"
 
 #include "paths.h"
+#include "docmap.h"
 #include "sci_c.h"
 
 #include "BackgroundWorker.h"
+#include "BackendConsistency.h"
 #include "CancellableSpawn.h"
 #include "DocumentTrack.h"
 #include "ExecutionProviders.h"
 #include "HeatmapApply.h"
 #include "ModelZoo.h"
+#include "OrtRuntime.h"
 #include "SemanticHeatmapColors.h"
 #include "SentenceSplitter.h"
 
@@ -121,6 +124,7 @@ struct Controller {
     guint query_timer = 0;
     guint rebuild_timer = 0;
 
+    MarkerSyncState bookmark_state;
     ModelZoo zoo;
     std::unique_ptr<EmbeddingProvider> provider;
     std::unique_ptr<SimilarityEngine> engine;
@@ -195,6 +199,7 @@ struct Controller {
     {
         if (indicator < 0) return;
         if (sci) configure_indicator_on(sci);
+        configure_indicator_on(docmap_scintilla());
         if (!track.active()) return;
         /* Indicator style is per view. Every clone of this document
          * needs the same text-foreground style or the shared ranges
@@ -236,7 +241,7 @@ struct Controller {
         fns.add_on_line = [this, w](int line) {
             return static_cast<int>(send(w, SCI_MARKERADD, static_cast<uptr_t>(line), marker));
         };
-        sync_marker_handles(track.handles(), want, mask, fns);
+        sync_marker_handles(track.handles(), want, mask, fns, &bookmark_state);
     }
 
     SemanticHeatmap::Profile heatmap_profile() const
@@ -349,6 +354,21 @@ struct Controller {
         run_query();
     }
 
+    // Worker thread only. Never score a new backend against the old index.
+    bool rebuild_after_backend_change(uint64_t before, uint64_t gen)
+    {
+        if (!invalidate_changed_backend(*provider, before, *index, cache)) return false;
+        // Invalidate already queued UI results before requesting the rebuild.
+        if (!build_gen.compare_exchange_strong(gen, gen + 1)) return true;
+        post_main([this, expected = gen + 1] {
+            if (build_gen.load() != expected || idle_gate().dead.load()) return;
+            index_ready = false;
+            clear_heatmap();
+            rebuild_now();
+        });
+        return true;
+    }
+
     void run_query()
     {
         uint64_t qgen = query_gen.load();
@@ -358,7 +378,10 @@ struct Controller {
             if (qgen != query_gen.load() || bgen != build_gen.load() || !provider || !index) return;
             std::vector<float> qvec;
             std::string error;
-            if (!provider->embed_batch({q}, qvec, error, {})) {
+            const auto backend = provider->backend_generation();
+            bool embedded = provider->embed_batch({q}, qvec, error, {});
+            if (rebuild_after_backend_change(backend, bgen)) return;
+            if (!embedded) {
                 if (qgen != query_gen.load() || bgen != build_gen.load()) return;
                 post_main([this, qgen, bgen, error] {
                     if (qgen != query_gen.load() || bgen != build_gen.load()) return;
@@ -417,6 +440,7 @@ struct Controller {
         if (!open || !sci || !doc) return;
         uint64_t gen = build_gen.fetch_add(1) + 1;
         downloads.cancel();
+        const auto download_ticket = downloads.ticket();
         index_ready = false;
         clear_heatmap();
         sptr_t doc_len = send(sci, SCI_GETLENGTH, 0, 0);
@@ -442,13 +466,13 @@ struct Controller {
         std::string want_model = model_id;
         std::string want_ep = ep_id;
         set_status("Indexing...", true);
-        worker.post([this, gen, bytes = std::move(bytes), first, q, qgen, want_model, want_ep] {
+        worker.post([this, gen, bytes = std::move(bytes), first, q, qgen, want_model, want_ep, download_ticket] {
             if (idle_gate().dead.load() || worker.stopping() || gen != build_gen.load()) return;
-            build_job(gen, bytes, first, q, qgen, want_model, want_ep);
+            build_job(gen, bytes, first, q, qgen, want_model, want_ep, download_ticket);
         });
     }
 
-    bool ensure_provider(const std::string &want_model, const std::string &want_ep, std::string &error)
+    bool ensure_provider(const std::string &want_model, const std::string &want_ep, CancellableSpawn::Ticket ticket, std::string &error)
     {
         const ModelSpec *spec = zoo.find(want_model);
         if (!spec) {
@@ -457,6 +481,11 @@ struct Controller {
         }
         bool same = provider && provider->available() && loaded_model == spec->id && loaded_ep == want_ep;
         if (same) return true;
+        if (downloads.cancelled(ticket)) { error = "cancelled"; return false; }
+        if (!npp_ort_runtime_available()) {
+            error = npp_ort_missing_message();
+            return false;
+        }
         std::string dir = storage_dir(spec->id);
         std::string model_path = dir + "/" + spec->model.filename;
         bool have_model = g_file_test(model_path.c_str(), G_FILE_TEST_IS_REGULAR);
@@ -467,7 +496,7 @@ struct Controller {
                 set_status("Downloading " + name + "...", true);
             });
         }
-        if (!zoo.ensure(*spec, dir, error, &downloads)) return false;
+        if (!zoo.ensure(*spec, dir, error, &downloads, ticket)) return false;
         OnnxProviderConfig cfg;
         cfg.model_path = dir + "/" + spec->model.filename;
         cfg.vocab_path = dir + "/" + spec->vocab.filename;
@@ -477,7 +506,7 @@ struct Controller {
         cfg.execution_provider = want_ep;
         auto created = make_onnx_provider(cfg, error);
         if (!created) return false;
-        if (loaded_model != spec->id || loaded_ep != want_ep) cache.clear();
+        cache.clear(); // A new session must never inherit a previous backend's vectors.
         provider = std::move(created);
         loaded_model = spec->id;
         loaded_ep = want_ep;
@@ -489,7 +518,8 @@ struct Controller {
 
     void build_job(uint64_t gen, const std::string &bytes, int64_t first,
                    const std::string &q, uint64_t qgen,
-                   const std::string &want_model, const std::string &want_ep)
+                   const std::string &want_model, const std::string &want_ep,
+                   CancellableSpawn::Ticket ticket)
     {
         if (idle_gate().dead.load() || worker.stopping() || gen != build_gen.load()) return;
         auto spans_now = split_sentences(bytes);
@@ -524,7 +554,7 @@ struct Controller {
             return;
         }
         std::string error;
-        if (!ensure_provider(want_model, want_ep, error)) {
+        if (!ensure_provider(want_model, want_ep, ticket, error)) {
             if (gen != build_gen.load() || error == "cancelled") return;
             post_main([this, gen, error] {
                 if (gen != build_gen.load()) return;
@@ -549,7 +579,7 @@ struct Controller {
 
         std::vector<float> qvec;
         bool have_q = false;
-        std::string backend_before = provider->backend_name();
+        auto backend_before = provider->backend_generation();
         if (!q.empty() && qgen == query_gen.load()) {
             std::string qerr;
             if (provider->embed_batch({q}, qvec, qerr, {}) &&
@@ -558,7 +588,7 @@ struct Controller {
         }
         /* A query that knocked the session down to CPU must not reuse
          * sentence vectors cached from the GPU session. */
-        if (provider->backend_name() != backend_before) cache.clear();
+        if (provider->backend_generation() != backend_before) cache.clear();
 
         struct Row {
             std::string text;
@@ -704,8 +734,10 @@ struct Controller {
         if (!have_q && !q.empty() && qgen == query_gen.load()) {
             std::string qerr;
             std::vector<float> again;
-            if (provider->embed_batch({q}, again, qerr, {}) &&
-                static_cast<int>(again.size()) == dim) {
+            const auto backend = provider->backend_generation();
+            bool embedded_query = provider->embed_batch({q}, again, qerr, {});
+            if (rebuild_after_backend_change(backend, gen)) return;
+            if (embedded_query && static_cast<int>(again.size()) == dim) {
                 qvec = std::move(again);
                 have_q = true;
             }
@@ -1131,4 +1163,10 @@ void semantic_search_note_closed(NppDoc *closing)
 void semantic_search_shutdown(void)
 {
     ctrl().shutdown();
+}
+
+void semantic_search_configure_view(GtkWidget *sci)
+{
+    if (idle_gate().dead.load()) return;
+    ctrl().configure_indicator_on(sci);
 }

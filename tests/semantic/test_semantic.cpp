@@ -5,6 +5,7 @@
  * int8 throughput.
  */
 #include "CancellableSpawn.h"
+#include "BackendConsistency.h"
 #include "DocumentTrack.h"
 #include "EmbedFallback.h"
 #include "ExecutionProviders.h"
@@ -649,14 +650,16 @@ void test_manifest_arch_filter()
 
 void test_download_failure_message()
 {
-    std::string network = ModelZoo::download_failure_message("offline-demo", false);
+    std::string network = ModelZoo::download_failure_message("offline-demo", false, 6);
     std::string curl = ModelZoo::download_failure_message("offline-demo", true);
     expect(network.find("offline-demo") != std::string::npos, network);
     expect(network.find("not installed") != std::string::npos, network);
     expect(network.find("network") != std::string::npos, network);
     expect(network.find("curl") == std::string::npos, network);
     expect(curl.find("curl") != std::string::npos, curl);
-    expect(curl.find("network") != std::string::npos, curl);
+    expect(ModelZoo::download_failure_message("m", false, 22).find("HTTP") != std::string::npos, "HTTP failure");
+    expect(ModelZoo::download_failure_message("m", false, 23).find("disk") != std::string::npos, "disk failure");
+    expect(ModelZoo::download_failure_message("m", false, 60).find("TLS") != std::string::npos, "TLS failure");
 
     ModelSpec spec;
     spec.id = "offline-demo";
@@ -674,11 +677,16 @@ void test_download_failure_message()
     expect(!zoo.ensure(spec, dir, error), "missing file should fail");
     expect(error.find("offline-demo") != std::string::npos, error);
     expect(error.find("not installed") != std::string::npos, error);
-    expect(error.find("network") != std::string::npos, error);
+    expect(error.find("source file") != std::string::npos, error);
     expect(error.find("curl:") == std::string::npos, error);
     expect(error != "cancelled", error);
 
     CancellableSpawn spawn;
+    auto ticket = spawn.ticket();
+    spawn.cancel();
+    std::string stale;
+    expect(!zoo.ensure(spec, dir, stale, &spawn, ticket) && stale == "cancelled",
+           "queued ensure cannot acquire a new ticket after cancel");
     spawn.retire();
     std::string cancelled;
     expect(!zoo.ensure(spec, dir, cancelled, &spawn), "retired download should fail");
@@ -846,32 +854,72 @@ void test_document_track_and_handles()
     mask[3] = bit;
     sync_marker_handles(handles, {3, 6}, bit, fns);
     expect(handles.size() == 1 && handles[0] == kept, "pre-existing bookmark left alone");
-    line_of.erase(kept);
-    sync_marker_handles(handles, {}, bit, fns);
-    expect(handles.empty(), "gone handle is dropped");
+    // Scintilla moves a deleted line's marker to its neighbour.
+    line_of[kept] = 4;
+    sync_marker_handles(handles, {3}, bit, fns);
+    expect(line_of.count(kept) == 0, "moved marker removed by handle");
     expect(mask[3] == bit, "user bookmark remains");
+
+    MarkerSyncState state;
+    mask.clear(); line_of.clear(); handles.clear(); next_handle = 0;
+    sync_marker_handles(handles, {7}, bit, fns, &state);
+    expect(handles.size() == 1 && handles[0] == 0, "zero is a valid marker handle");
+    line_of.clear(); mask.clear(); // user removes the feature bookmark
+    sync_marker_handles(handles, {7, 8}, bit, fns, &state);
+    expect(handles.size() == 1 && line_of[handles[0]] == 8, "next batch respects removed bookmark");
+    sync_marker_handles(handles, {7, 8}, bit, fns, &state);
+    expect(handles.size() == 1, "later batches still respect removal");
+    sync_marker_handles(handles, {}, bit, fns, &state);
+    mask.clear();
+    sync_marker_handles(handles, {7}, bit, fns, &state);
+    expect(handles.size() == 1, "new selection may add a bookmark again");
 }
 
 void test_indicator_alloc()
 {
-    int next = NPP_INDICATOR_FIRST;
-    int out = -1;
-    expect(npp_indicator_alloc(&next, 1, &out) && out == 10 && next == 11, "skip indicator 9");
-    next = 18;
-    expect(npp_indicator_alloc(&next, 4, &out) && out == 20 && next == 24, "20 is allocatable");
-    next = 18;
-    expect(npp_indicator_alloc(&next, 12, &out) && out == 20 && next == 32,
-           "twelve slots fit from 20");
-    next = 18;
-    expect(!npp_indicator_alloc(&next, 13, &out), "thirteen slots do not fit");
-    next = 10;
-    expect(npp_indicator_alloc(&next, 9, &out) && out == 10 && next == 19, "range stops before 19");
-    next = 10;
-    expect(npp_indicator_alloc(&next, 10, &out) && out == 20, "range jumps over 19");
-    int untouched = 10;
-    expect(!npp_indicator_alloc(nullptr, 1, &out), "null cursor");
-    expect(!npp_indicator_alloc(&untouched, 0, &out), "empty count");
-    expect(untouched == 10, "failed alloc moved the cursor");
+    int next = 9, out = -1;
+    expect(npp_indicator_alloc(&next, 9, &out) && out == 10 && next == 19, "contiguous plugin range");
+    expect(npp_indicator_alloc(&next, 1, &out) && out == 20 && next == 21, "last plugin slot");
+    expect(!npp_indicator_alloc(&next, 1, &out) && out == 0 && next == 21, "never allocate editor slots");
+    next = 18; out = 99;
+    expect(!npp_indicator_alloc(&next, 2, &out) && out == 0 && next == 18, "do not span reserved 19");
+    expect(!npp_indicator_alloc(nullptr, 1, &out) && out == 0, "null cursor clears output");
+    expect(!npp_indicator_alloc(&next, 0, &out) && out == 0, "zero request clears output");
+}
+
+void test_query_backend_change()
+{
+    class QueryFallback : public EmbeddingProvider {
+    public:
+        uint64_t generation = 0;
+        bool fail_cpu = false;
+        int dimension() const override { return 2; }
+        int max_tokens() const override { return 8; }
+        bool available() const override { return true; }
+        std::string backend_name() const override { return "test"; }
+        uint64_t backend_generation() const override { return generation; }
+        size_t token_count(const std::string &) const override { return 1; }
+        bool embed_batch(const std::vector<std::string> &, std::vector<float> &out,
+                         std::string &, const SemanticBatchProgress &) override {
+            ++generation;
+            out = {0, 1};
+            return !fail_cpu;
+        }
+    } provider;
+    auto engine = make_cpu_similarity_engine();
+    auto index = make_memory_vector_index(*engine);
+    for (bool fail : {false, true}) {
+        provider.fail_cpu = fail;
+        index->reset(2);
+        std::unordered_map<std::string, std::vector<float>> cache{{"sentence", {1, 0}}};
+        index->add(cache["sentence"].data(), 1);
+        auto before = provider.backend_generation();
+        expect(!invalidate_changed_backend(provider, before, *index, cache), "stable backend keeps vectors");
+        std::vector<float> query; std::string error;
+        provider.embed_batch({"query"}, query, error, {});
+        expect(invalidate_changed_backend(provider, before, *index, cache), "query fallback requires rebuild even if CPU fails");
+        expect(cache.empty() && index->count() == 0, "GPU cache and index both discarded before CPU query scoring");
+    }
 }
 
 } /* namespace */
@@ -894,6 +942,7 @@ int main(int argc, char **argv)
     test_embed_fallback_restarts();
     test_document_track_and_handles();
     test_indicator_alloc();
+    test_query_backend_change();
     test_providers();
 #if NPP_HAVE_ONNXRUNTIME
     if (do_bench) return bench();

@@ -20,6 +20,8 @@ void       semantic_search_toggle(void);
 
 /* sci is the editor that changed. Ignored when the bar is closed. */
 void semantic_search_note_modified(GtkWidget *sci);
+/* Indicator styles are view-local, including clones and the document map. */
+void semantic_search_configure_view(GtkWidget *sci);
 /* sci is the editor that just became current. */
 void semantic_search_note_activated(GtkWidget *sci);
 /* Call while doc->sci is still alive. */

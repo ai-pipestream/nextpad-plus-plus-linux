@@ -7,6 +7,7 @@ static bool indicator_reserved(int slot)
 
 bool npp_indicator_alloc(int *next, int count, int *out)
 {
+    if (out) *out = 0;
     if (!next || !out || count < 1) return false;
     int start = *next;
     if (start < NPP_INDICATOR_FIRST) start = NPP_INDICATOR_FIRST;

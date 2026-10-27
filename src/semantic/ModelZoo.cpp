@@ -51,10 +51,10 @@ bool parse_file(const Json &node, ModelFile &file, std::string &error)
 }
 
 bool download_url(const std::string &url, const std::string &dest,
-                  const std::string &model_id, CancellableSpawn &spawn, std::string &error)
+                  const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error)
 {
     std::string partial = dest + ".partial";
-    if (spawn.retired()) {
+    if (spawn.cancelled(ticket)) {
         error = "cancelled";
         return false;
     }
@@ -65,8 +65,8 @@ bool download_url(const std::string &url, const std::string &dest,
         "--max-time", "180",
         "-o", partial,
         url
-    });
-    if (result.cancelled || spawn.retired()) {
+    }, ticket);
+    if (result.cancelled || spawn.cancelled(ticket)) {
         g_unlink(partial.c_str());
         error = "cancelled";
         return false;
@@ -77,7 +77,7 @@ bool download_url(const std::string &url, const std::string &dest,
         return false;
     }
     if (!result.exited || result.exit_code != 0) {
-        error = ModelZoo::download_failure_message(model_id, false);
+        error = ModelZoo::download_failure_message(model_id, false, result.exit_code);
         g_unlink(partial.c_str());
         return false;
     }
@@ -90,8 +90,9 @@ bool download_url(const std::string &url, const std::string &dest,
 }
 
 bool ensure_one(const ModelFile &file, const std::string &dest_dir,
-                const std::string &model_id, CancellableSpawn &spawn, std::string &error)
+                const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error)
 {
+    if (spawn.cancelled(ticket)) { error = "cancelled"; return false; }
     std::string dest = dest_dir + "/" + file.filename;
     std::string hex;
     if (g_file_test(dest.c_str(), G_FILE_TEST_IS_REGULAR)) {
@@ -99,7 +100,7 @@ bool ensure_one(const ModelFile &file, const std::string &dest_dir,
         if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) == 0) return true;
         g_unlink(dest.c_str());
     }
-    if (!download_url(file.url, dest, model_id, spawn, error)) return false;
+    if (!download_url(file.url, dest, model_id, spawn, ticket, error)) return false;
     if (!ModelZoo::file_sha256(dest, hex, error)) return false;
     if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) != 0) {
         g_unlink(dest.c_str());
@@ -234,25 +235,34 @@ const ModelSpec *ModelZoo::find(const std::string &id) const
 }
 
 bool ModelZoo::ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error,
-                      CancellableSpawn *spawn) const
+                      CancellableSpawn *spawn, std::optional<CancellableSpawn::Ticket> requested_ticket) const
 {
     CancellableSpawn local;
     if (!spawn) spawn = &local;
+    const auto ticket = requested_ticket.value_or(spawn->ticket());
+    if (spawn->cancelled(ticket)) { error = "cancelled"; return false; }
     if (g_mkdir_with_parents(dest_dir.c_str(), 0700) != 0) {
         error = "could not create " + dest_dir;
         return false;
     }
-    if (!ensure_one(spec.vocab, dest_dir, spec.id, *spawn, error)) return false;
-    if (!ensure_one(spec.model, dest_dir, spec.id, *spawn, error)) return false;
+    if (!ensure_one(spec.vocab, dest_dir, spec.id, *spawn, ticket, error)) return false;
+    if (!ensure_one(spec.model, dest_dir, spec.id, *spawn, ticket, error)) return false;
     return true;
 }
 
-std::string ModelZoo::download_failure_message(const std::string &model_id, bool curl_missing)
+std::string ModelZoo::download_failure_message(const std::string &model_id, bool curl_missing,
+                                                int exit_code)
 {
-    if (curl_missing) {
-        return "Model " + model_id +
-               " is not installed. Downloading it needs curl and a network connection.";
+    std::string reason;
+    if (curl_missing) reason = "Could not start curl; check that it is installed.";
+    else switch (exit_code) {
+    case 5: case 6: case 7: reason = "Could not connect; check the network and server address."; break;
+    case 22: reason = "The server returned an HTTP error (for example 404 or 403)."; break;
+    case 23: reason = "Could not write the download; check disk space and permissions."; break;
+    case 28: reason = "The download timed out."; break;
+    case 35: case 51: case 60: case 77: reason = "TLS connection or certificate verification failed."; break;
+    case 37: reason = "The source file could not be read."; break;
+    default: reason = "Download failed (curl exit " + std::to_string(exit_code) + ")."; break;
     }
-    return "Model " + model_id +
-           " is not installed. Downloading it needs a network connection.";
+    return "Model " + model_id + " is not installed. " + reason;
 }

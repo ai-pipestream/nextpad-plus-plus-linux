@@ -70,14 +70,21 @@ void DocumentTrack::apply_close(const DocCloseResult &result)
 void sync_marker_handles(std::vector<int> &handles,
                          const std::set<int> &want_lines,
                          unsigned bookmark_bit,
-                         const MarkerFns &fns)
+                         const MarkerFns &fns, MarkerSyncState *state)
 {
+    if (state && want_lines.empty()) *state = {};
+    std::map<int, int> next_lines;
     std::vector<int> keep;
     std::set<int> have;
     keep.reserve(handles.size());
     for (int handle : handles) {
         int line = fns.line_from_handle ? fns.line_from_handle(handle) : -1;
+        if (state && line < 0 && !want_lines.empty()) {
+            auto old = state->last_lines.find(handle);
+            if (old != state->last_lines.end()) state->dismissed_lines.insert(old->second);
+        }
         if (line >= 0 && want_lines.count(line)) {
+            next_lines[handle] = line;
             keep.push_back(handle);
             have.insert(line);
         } else if (line >= 0 && fns.delete_handle) {
@@ -86,14 +93,16 @@ void sync_marker_handles(std::vector<int> &handles,
     }
     if (fns.add_on_line) {
         for (int line : want_lines) {
-            if (have.count(line)) continue;
+            if (have.count(line) || (state && state->dismissed_lines.count(line))) continue;
             unsigned mask = fns.mask_on_line ? fns.mask_on_line(line) : 0u;
             if (mask & bookmark_bit) continue;
             int handle = fns.add_on_line(line);
-            if (handle <= 0) continue;
+            if (handle < 0) continue;
+            next_lines[handle] = line;
             keep.push_back(handle);
             have.insert(line);
         }
     }
     handles.swap(keep);
+    if (state) state->last_lines = std::move(next_lines);
 }

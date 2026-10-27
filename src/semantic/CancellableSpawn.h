@@ -27,13 +27,16 @@ public:
         std::string spawn_error;
     };
 
-    Result run(const std::vector<std::string> &args);
+    using Ticket = uint64_t;
+    Ticket ticket() const { return cancel_gen_.load(); }
+    bool cancelled(Ticket ticket) const { return retired_.load() || cancel_gen_.load() != ticket; }
+    Result run(const std::vector<std::string> &args) { return run(args, ticket()); }
+    Result run(const std::vector<std::string> &args, Ticket ticket);
     void cancel();
     void retire();
     bool retired() const { return retired_.load(); }
 
-    /* Called after this run samples the cancel generation and before it
-     * takes the lock. Tests use it to cancel in that window. */
+    /* Called before the launch lock. Tests use it to cancel in that window. */
     void set_pre_lock_hook(std::function<void()> hook);
 
 private:

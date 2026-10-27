@@ -699,6 +699,10 @@ struct Controller {
         query_gen.fetch_add(1);
         downloads.retire();
         worker.shutdown();
+        /* Release sessions before process-exit handlers tear down the
+         * dynamically loaded GPU runtime. The worker must finish first. */
+        engine.reset();
+        provider.reset();
     }
 
     ~Controller() { shutdown(); }

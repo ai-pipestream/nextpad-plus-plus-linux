@@ -1,11 +1,10 @@
 #include "ModelZoo.h"
+#include "CancellableSpawn.h"
 #include "JsonMini.h"
 
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <gio/gio.h>
-
-#include <sys/wait.h>
 
 #include <cctype>
 #include <fstream>
@@ -51,41 +50,39 @@ bool parse_file(const Json &node, ModelFile &file, std::string &error)
     return true;
 }
 
-bool download_url(const std::string &url, const std::string &dest, std::string &error)
+bool download_url(const std::string &url, const std::string &dest,
+                  CancellableSpawn &spawn, std::string &error)
 {
     std::string partial = dest + ".partial";
-    gchar *argv[] = {
-        (gchar *)"curl",
-        (gchar *)"-fL",
-        (gchar *)"--retry", (gchar *)"3",
-        (gchar *)"--retry-delay", (gchar *)"1",
-        (gchar *)"--max-time", (gchar *)"180",
-        (gchar *)"-o", (gchar *)partial.c_str(),
-        (gchar *)url.c_str(),
-        nullptr
-    };
-    gint status = -1;
-    GError *gerr = nullptr;
-    gchar *stderr_buf = nullptr;
-    gboolean ok = g_spawn_sync(nullptr, argv, nullptr,
-                               G_SPAWN_SEARCH_PATH,
-                               nullptr, nullptr,
-                               nullptr, &stderr_buf, &status, &gerr);
-    if (!ok) {
-        error = gerr ? gerr->message : "could not run curl";
-        if (gerr) g_error_free(gerr);
-        g_free(stderr_buf);
+    if (spawn.retired()) {
+        error = "cancelled";
         return false;
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        error = stderr_buf && *stderr_buf
-                    ? std::string("download failed: ") + stderr_buf
-                    : "download failed";
-        g_free(stderr_buf);
+    CancellableSpawn::Result result = spawn.run({
+        "curl", "-fL",
+        "--retry", "3",
+        "--retry-delay", "1",
+        "--max-time", "180",
+        "-o", partial,
+        url
+    });
+    if (result.cancelled || spawn.retired()) {
+        g_unlink(partial.c_str());
+        error = "cancelled";
+        return false;
+    }
+    if (!result.started || !result.spawn_error.empty()) {
+        error = result.spawn_error.empty() ? "could not run curl" : result.spawn_error;
         g_unlink(partial.c_str());
         return false;
     }
-    g_free(stderr_buf);
+    if (!result.exited || result.exit_code != 0) {
+        error = result.stderr_text.empty()
+                    ? "download failed"
+                    : std::string("download failed: ") + result.stderr_text;
+        g_unlink(partial.c_str());
+        return false;
+    }
     if (g_rename(partial.c_str(), dest.c_str()) != 0) {
         error = "could not move downloaded file into place";
         g_unlink(partial.c_str());
@@ -94,7 +91,8 @@ bool download_url(const std::string &url, const std::string &dest, std::string &
     return true;
 }
 
-bool ensure_one(const ModelFile &file, const std::string &dest_dir, std::string &error)
+bool ensure_one(const ModelFile &file, const std::string &dest_dir,
+                CancellableSpawn &spawn, std::string &error)
 {
     std::string dest = dest_dir + "/" + file.filename;
     std::string hex;
@@ -103,7 +101,7 @@ bool ensure_one(const ModelFile &file, const std::string &dest_dir, std::string 
         if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) == 0) return true;
         g_unlink(dest.c_str());
     }
-    if (!download_url(file.url, dest, error)) return false;
+    if (!download_url(file.url, dest, spawn, error)) return false;
     if (!ModelZoo::file_sha256(dest, hex, error)) return false;
     if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) != 0) {
         g_unlink(dest.c_str());
@@ -232,13 +230,16 @@ const ModelSpec *ModelZoo::find(const std::string &id) const
     return nullptr;
 }
 
-bool ModelZoo::ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error) const
+bool ModelZoo::ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error,
+                      CancellableSpawn *spawn) const
 {
+    CancellableSpawn local;
+    if (!spawn) spawn = &local;
     if (g_mkdir_with_parents(dest_dir.c_str(), 0700) != 0) {
         error = "could not create " + dest_dir;
         return false;
     }
-    if (!ensure_one(spec.vocab, dest_dir, error)) return false;
-    if (!ensure_one(spec.model, dest_dir, error)) return false;
+    if (!ensure_one(spec.vocab, dest_dir, *spawn, error)) return false;
+    if (!ensure_one(spec.model, dest_dir, *spawn, error)) return false;
     return true;
 }

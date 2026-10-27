@@ -3496,7 +3496,10 @@ void editor_close_all_quit(GApplication *app)
      * quit is COMMITTED — a cancelled quit above fires neither. Fired
      * before tab teardown so plugins can still query open buffers; the
      * teardown itself does not fire per-file FILECLOSED (macOS parity).
-     * Covers every quit route: menu Quit, Ctrl+Q, window close. */
+     * Covers every quit route: menu Quit, Ctrl+Q, window close.
+     * Semantic indexing is stopped first, while the editors it paints
+     * are still alive, so quit does not wait on a model download. */
+    semantic_search_shutdown();
     plugin_notify_before_shutdown();
     plugin_notify_shutdown();
 

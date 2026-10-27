@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+class CancellableSpawn;
+
 struct ModelFile {
     std::string filename;
     std::string url;
@@ -41,8 +43,11 @@ public:
 
     /* Create dest_dir and make sure spec.model and spec.vocab are present
      * there under their filenames, with matching SHA-256. A file that is
-     * already correct is not downloaded again. */
-    bool ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error) const;
+     * already correct is not downloaded again. When spawn is set, an
+     * in-flight download can be cancelled or the spawner can be retired
+     * so shutdown does not wait for curl's full timeout. */
+    bool ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error,
+                CancellableSpawn *spawn = nullptr) const;
 
     static std::string host_arch();
     static bool file_sha256(const std::string &path, std::string &hex, std::string &error);

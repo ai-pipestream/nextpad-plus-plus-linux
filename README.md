@@ -229,9 +229,11 @@ not required for inference. The script uses an isolated runtime prefix and
 requires `curl` plus either `uv` (Python 3.12) or a compatible Python with pip.
 It does not install or modify GPU drivers or system CUDA libraries.
 
-The default installation prefix is `.cache/onnxruntime`; CMake discovers its
-`current` SDK link. Follow the printed CMake command when changing an existing
-build's runtime. Pass `[prefix] [auto|cpu|cuda|openvino]` to override installation
+The default installation prefix is `.cache/onnxruntime`. The editor loads that
+runtime with dlopen and does not link libonnxruntime, so it still starts when
+the library is absent and the search status says `embeddings disabled: ONNX Runtime not found`.
+Pass `-DONNXRUNTIME_ROOT` as the setup script prints, or export `ONNXRUNTIME_ROOT`
+before launch, to search that prefix. Pass `[prefix] [auto|cpu|cuda|openvino]` to override installation
 selection. CUDA 12 uses ONNX Runtime 1.24.1; CUDA 13 uses 1.31.0; OpenVINO uses
 1.24.1. NVIDIA requires compatible cuDNN 9. Intel requires its GPU driver and
 access to `/dev/dri/renderD*` (`clinfo -l` checks OpenCL discovery).
@@ -245,7 +247,7 @@ build ONNX Runtime with `CMAKE_CUDA_ARCHITECTURES=87` and the installed JetPack
 CUDA/cuDNN. Runtime versions alone do not prove GPU compatibility.
 
 Semantic search defaults to **Automatic** execution and fp32 MiniLM. Automatic
-tries CUDA, then OpenVINO GPU, then CPU, within the linked runtime's available
+tries CUDA, then OpenVINO GPU, then CPU, within the loaded runtime's available
 providers. It verifies real inference; failed, non-finite, or invalid GPU output
 retries on CPU. OpenVINO uses GPU/FP32 and CUDA disables TF32 for score parity.
 Existing saved choices are preserved; select Automatic for an existing profile.
@@ -277,8 +279,10 @@ model profiles. `python3 tests/semantic/test_runtime_detection.py` checks setup
 selection without requiring GPU hardware.
 
 The setup script is for local builds. Distributing a GPU-enabled package also
-requires packaging its provider plugins and runtime dependencies;
-`NPP_BUNDLE_ONNXRUNTIME` alone bundles only the core ONNX Runtime library.
+requires packaging its provider plugins and runtime dependencies.
+`NPP_BUNDLE_ONNXRUNTIME` installs the core library under its SONAME and the
+provider libraries from that prefix into the private lib directory. The editor
+still has no link dependency; it loads the bundled copy from beside the executable.
 
 Validated on 2026-10-24 with real C++ embedding inference:
 

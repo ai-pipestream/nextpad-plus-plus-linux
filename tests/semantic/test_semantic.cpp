@@ -1,9 +1,11 @@
 /*
  * Tokenizer, heatmap, sentence, index, manifest, and embedding checks.
- * Embedding numbers run only when ONNX Runtime is linked and the model
- * files named below are present. Pass --bench to print int8 throughput.
+ * Embedding numbers run only when the ONNX Runtime loader is compiled
+ * in and the model files named below are present. Pass --bench to print
+ * int8 throughput.
  */
 #include "ExecutionProviders.h"
+#include "OrtRuntime.h"
 #include "ModelZoo.h"
 #include "SemanticHeatmapColors.h"
 #include "SemanticInterfaces.h"
@@ -347,27 +349,27 @@ void test_providers()
     std::string error;
     auto turbo = make_turboembed_provider(error);
     expect(!turbo && error.find("TurboEmbed") != std::string::npos, error);
+    bool ort_loaded = npp_ort_runtime_available();
     auto cat = execution_provider_catalog();
     bool saw_cpu = false;
     for (const ExecProviderInfo &ep : cat) {
         if (ep.id == "cpu") {
             saw_cpu = true;
-#if NPP_HAVE_ONNXRUNTIME
-            expect(ep.runtime_present, "cpu present");
-#else
-            expect(!ep.runtime_present, "cpu absent without ORT");
-#endif
+            expect(ep.runtime_present == ort_loaded,
+                   ort_loaded ? "cpu present" : "cpu absent without ONNX Runtime");
         }
+        if (ep.id == "auto")
+            expect(ep.runtime_present == ort_loaded, "auto follows the loaded runtime");
     }
     expect(saw_cpu, "catalog lists cpu");
-#if !NPP_HAVE_ONNXRUNTIME
-    OnnxProviderConfig cfg;
-    cfg.dimension = 384;
-    cfg.max_tokens = 256;
-    cfg.pooling = "mean";
-    auto missing = make_onnx_provider(cfg, error);
-    expect(!missing && error.find("not linked") != std::string::npos, error);
-#endif
+    if (!ort_loaded) {
+        OnnxProviderConfig cfg;
+        cfg.dimension = 384;
+        cfg.max_tokens = 256;
+        cfg.pooling = "mean";
+        auto missing = make_onnx_provider(cfg, error);
+        expect(!missing && error.find(npp_ort_missing_message()) != std::string::npos, error);
+    }
 }
 
 #if NPP_HAVE_ONNXRUNTIME

@@ -3,7 +3,10 @@
 #include "paths.h"
 #include "sci_c.h"
 
+#include "BackgroundWorker.h"
+#include "CancellableSpawn.h"
 #include "ExecutionProviders.h"
+#include "HeatmapApply.h"
 #include "ModelZoo.h"
 #include "SemanticHeatmapColors.h"
 #include "SentenceSplitter.h"
@@ -12,16 +15,13 @@
 
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
 #include <cstdio>
-#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +39,22 @@ struct Span {
     int64_t byte_length = 0;
 };
 
+/* Idle callbacks and the worker share this gate. shutdown() sets dead
+ * before it joins the worker, and every callback checks it before
+ * touching a widget. post_main() holds the mutex across that check and
+ * the g_idle_add, so a callback cannot be queued once shutdown has
+ * started, including after the worker has been joined. */
+struct IdleGate {
+    std::mutex mu;
+    std::atomic<bool> dead{false};
+};
+
+IdleGate &idle_gate()
+{
+    static IdleGate gate;
+    return gate;
+}
+
 struct MainCall {
     std::function<void()> fn;
 };
@@ -46,61 +62,28 @@ struct MainCall {
 gboolean dispatch_main(gpointer data)
 {
     auto *call = static_cast<MainCall *>(data);
-    call->fn();
+    if (!idle_gate().dead.load()) call->fn();
     delete call;
     return G_SOURCE_REMOVE;
 }
 
 void post_main(std::function<void()> fn)
 {
-    g_idle_add(dispatch_main, new MainCall{std::move(fn)});
+    std::lock_guard<std::mutex> lock(idle_gate().mu);
+    if (idle_gate().dead.load()) return;
+    g_idle_add(dispatch_main, new MainCall{[fn = std::move(fn)] {
+        if (idle_gate().dead.load()) return;
+        fn();
+    }});
 }
 
-class Worker {
-public:
-    Worker() : thread_([this] { loop(); }) {}
-    ~Worker()
-    {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            stop_ = true;
-        }
-        cv_.notify_one();
-        if (thread_.joinable()) thread_.join();
-    }
-    void post(std::function<void()> fn)
-    {
-        {
-            std::lock_guard<std::mutex> lock(mu_);
-            queue_.push_back(std::move(fn));
-        }
-        cv_.notify_one();
-    }
-
-private:
-    void loop()
-    {
-        for (;;) {
-            std::function<void()> fn;
-            {
-                std::unique_lock<std::mutex> lock(mu_);
-                cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
-                if (stop_ && queue_.empty()) return;
-                fn = std::move(queue_.front());
-                queue_.pop_front();
-            }
-            fn();
-        }
-    }
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::deque<std::function<void()>> queue_;
-    bool stop_ = false;
-    std::thread thread_;
-};
-
 struct Controller {
-    Worker worker;
+    BackgroundWorker worker;
+    /* One spawner for model downloads. shutdown() retires it so a curl
+     * that is still running is killed, and a download that has not
+     * started does not start. */
+    CancellableSpawn downloads;
+    bool shut_down = false;
 
     GtkWidget *revealer = nullptr;
     GtkWidget *entry = nullptr;
@@ -303,6 +286,7 @@ struct Controller {
 
     void schedule_query()
     {
+        if (shut_down || idle_gate().dead.load()) return;
         if (query_timer) g_source_remove(query_timer);
         const char *text = entry ? gtk_editable_get_text(GTK_EDITABLE(entry)) : "";
         if (!text || !*text) {
@@ -311,8 +295,10 @@ struct Controller {
             return;
         }
         query_timer = g_timeout_add(kQueryDebounceMs, [](gpointer data) -> gboolean {
+            if (idle_gate().dead.load()) return G_SOURCE_REMOVE;
             auto *self = static_cast<Controller *>(data);
             self->query_timer = 0;
+            if (self->shut_down || idle_gate().dead.load()) return G_SOURCE_REMOVE;
             const char *now = gtk_editable_get_text(GTK_EDITABLE(self->entry));
             self->apply_query(now ? now : "");
             return G_SOURCE_REMOVE;
@@ -354,12 +340,25 @@ struct Controller {
             size_t got = n ? index->score_all(qvec.data(), hits.data(), n) : 0;
             hits.resize(got);
             post_main([this, qgen, bgen, hits = std::move(hits), got, n] {
+                if (idle_gate().dead.load()) return;
+                /* Both generations are read on this thread. A mismatch
+                 * means a newer query or document already updated the
+                 * screen, so this result must not paint or clear it. */
                 if (qgen != query_gen.load() || bgen != build_gen.load()) return;
                 if (got != n) {
                     clear_heatmap();
                     set_status("Could not score sentence embeddings", false);
                     return;
                 }
+                HeatmapApply action = heatmap_apply(false, bgen, build_gen.load(),
+                                                    qgen, query_gen.load(),
+                                                    query.empty(), hits.empty());
+                if (action == HeatmapApply::Clear) {
+                    clear_heatmap();
+                    set_status(index_status, false);
+                    return;
+                }
+                if (action != HeatmapApply::Paint) return;
                 last_hits = hits;
                 paint(last_hits);
                 set_status(index_status, false);
@@ -369,10 +368,13 @@ struct Controller {
 
     void schedule_rebuild()
     {
+        if (shut_down || idle_gate().dead.load()) return;
         if (rebuild_timer) g_source_remove(rebuild_timer);
         rebuild_timer = g_timeout_add(kRebuildDebounceMs, [](gpointer data) -> gboolean {
+            if (idle_gate().dead.load()) return G_SOURCE_REMOVE;
             auto *self = static_cast<Controller *>(data);
             self->rebuild_timer = 0;
+            if (self->shut_down || idle_gate().dead.load()) return G_SOURCE_REMOVE;
             self->rebuild_now();
             return G_SOURCE_REMOVE;
         }, this);
@@ -380,8 +382,10 @@ struct Controller {
 
     void rebuild_now()
     {
+        if (shut_down || idle_gate().dead.load()) return;
         if (!open || !sci || !doc) return;
         uint64_t gen = build_gen.fetch_add(1) + 1;
+        downloads.cancel();
         index_ready = false;
         clear_heatmap();
         sptr_t doc_len = send(sci, SCI_GETLENGTH, 0, 0);
@@ -408,6 +412,7 @@ struct Controller {
         std::string want_ep = ep_id;
         set_status("Indexing...", true);
         worker.post([this, gen, bytes = std::move(bytes), first, q, qgen, want_model, want_ep] {
+            if (idle_gate().dead.load() || worker.stopping() || gen != build_gen.load()) return;
             build_job(gen, bytes, first, q, qgen, want_model, want_ep);
         });
     }
@@ -427,11 +432,11 @@ struct Controller {
         if (!have_model) {
             std::string name = spec->name;
             post_main([this, gen = build_gen.load(), name] {
-                if (!open) return;
+                if (idle_gate().dead.load() || gen != build_gen.load() || !open) return;
                 set_status("Downloading " + name + "...", true);
             });
         }
-        if (!zoo.ensure(*spec, dir, error)) return false;
+        if (!zoo.ensure(*spec, dir, error, &downloads)) return false;
         OnnxProviderConfig cfg;
         cfg.model_path = dir + "/" + spec->model.filename;
         cfg.vocab_path = dir + "/" + spec->vocab.filename;
@@ -455,7 +460,7 @@ struct Controller {
                    const std::string &q, uint64_t qgen,
                    const std::string &want_model, const std::string &want_ep)
     {
-        if (gen != build_gen.load()) return;
+        if (idle_gate().dead.load() || worker.stopping() || gen != build_gen.load()) return;
         auto spans_now = split_sentences(bytes);
         if (spans_now.size() > kMaxSentences) {
             post_main([this, gen] {
@@ -545,7 +550,7 @@ struct Controller {
         }
 
         auto publish = [&](bool done) {
-            if (gen != build_gen.load()) return;
+            if (idle_gate().dead.load() || gen != build_gen.load()) return;
             std::vector<SemanticHit> hits;
             if (have_q && qgen == query_gen.load() && index->count()) {
                 hits.resize(index->count());
@@ -555,19 +560,29 @@ struct Controller {
             size_t total = spans_now.size();
             size_t n_embedded = embedded;
             std::string backend = provider->backend_name();
-            post_main([this, gen, hits = std::move(hits), done, total, n_embedded, backend, first] {
+            std::string model_label = loaded_model;
+            if (const ModelSpec *shown = zoo.find(loaded_model)) {
+                if (!shown->name.empty()) model_label = shown->name;
+            }
+            post_main([this, gen, qgen, hits = std::move(hits), done, total,
+                       n_embedded, backend, first, model_label] {
+                if (idle_gate().dead.load()) return;
                 if (gen != build_gen.load()) return;
                 next_id = first + static_cast<int64_t>(total);
-                if (!hits.empty()) {
+                /* query_gen is compared here, on the UI thread. Skip
+                 * leaves whatever a newer query already drew. Clear
+                 * drops colours and this feature's bookmarks when the
+                 * current query is empty or this batch has no hits. */
+                HeatmapApply action = heatmap_apply(false, gen, build_gen.load(),
+                                                    qgen, query_gen.load(),
+                                                    query.empty(), hits.empty());
+                if (action == HeatmapApply::Clear) clear_heatmap();
+                else if (action == HeatmapApply::Paint) {
                     last_hits = hits;
                     paint(hits);
                 }
                 char buf[256];
                 if (done) {
-                    std::string model_label = loaded_model;
-                    if (const ModelSpec *spec = zoo.find(loaded_model)) {
-                        if (!spec->name.empty()) model_label = spec->name;
-                    }
                     index_status = std::to_string(n_embedded) + " of " +
                                    std::to_string(total) +
                                    " sentences indexed · " + model_label +
@@ -588,7 +603,7 @@ struct Controller {
             std::vector<float> out;
             std::string emb_error;
             bool ok = provider->embed_batch(miss_text, out, emb_error, [&](const std::vector<size_t> &done_idx) {
-                if (gen != build_gen.load()) return false;
+                if (gen != build_gen.load() || worker.stopping()) return false;
                 for (size_t di : done_idx) {
                     if (di >= miss_text.size()) continue;
                     const float *src = out.data() + di * static_cast<size_t>(dim);
@@ -600,7 +615,7 @@ struct Controller {
                     }
                 }
                 publish(false);
-                return gen == build_gen.load();
+                return gen == build_gen.load() && !worker.stopping();
             });
             if (!ok) {
                 if (gen != build_gen.load() || emb_error == "cancelled") return;
@@ -618,6 +633,7 @@ struct Controller {
 
     void attach(GtkWidget *next)
     {
+        if (shut_down || idle_gate().dead.load()) return;
         NppDoc *next_doc = next ? static_cast<NppDoc *>(g_object_get_data(G_OBJECT(next), "npp-doc"))
                                 : nullptr;
         if (next == sci && next_doc == doc) {
@@ -626,6 +642,7 @@ struct Controller {
         }
         build_gen.fetch_add(1);
         query_gen.fetch_add(1);
+        downloads.cancel();
         if (rebuild_timer) {
             g_source_remove(rebuild_timer);
             rebuild_timer = 0;
@@ -642,6 +659,7 @@ struct Controller {
 
     void close_bar()
     {
+        if (shut_down || idle_gate().dead.load()) return;
         open = false;
         if (query_timer) g_source_remove(query_timer);
         if (rebuild_timer) g_source_remove(rebuild_timer);
@@ -649,6 +667,7 @@ struct Controller {
         rebuild_timer = 0;
         build_gen.fetch_add(1);
         query_gen.fetch_add(1);
+        downloads.cancel();
         clear_heatmap();
         index_ready = false;
         sci = nullptr;
@@ -659,6 +678,30 @@ struct Controller {
         if (current) cur = current->sci;
         if (cur) gtk_widget_grab_focus(cur);
     }
+
+    /* Idempotent. The destructor calls this so the worker is joined
+     * before the provider, index, and model registry are destroyed.
+     * editor_close_all_quit() calls it earlier, while document widgets
+     * are still alive. */
+    void shutdown()
+    {
+        if (shut_down) return;
+        shut_down = true;
+        {
+            std::lock_guard<std::mutex> lock(idle_gate().mu);
+            idle_gate().dead.store(true);
+        }
+        if (query_timer) g_source_remove(query_timer);
+        if (rebuild_timer) g_source_remove(rebuild_timer);
+        query_timer = 0;
+        rebuild_timer = 0;
+        build_gen.fetch_add(1);
+        query_gen.fetch_add(1);
+        downloads.retire();
+        worker.shutdown();
+    }
+
+    ~Controller() { shutdown(); }
 };
 
 Controller &ctrl()
@@ -669,12 +712,13 @@ Controller &ctrl()
 
 void on_entry_changed(GtkEditable *, gpointer)
 {
-    if (!ctrl().ui_ready) return;
+    if (idle_gate().dead.load() || !ctrl().ui_ready) return;
     ctrl().schedule_query();
 }
 
 gboolean on_entry_key(GtkEventControllerKey *, guint keyval, guint, GdkModifierType, gpointer)
 {
+    if (idle_gate().dead.load()) return FALSE;
     if (keyval == GDK_KEY_Escape) {
         ctrl().close_bar();
         return TRUE;
@@ -691,7 +735,7 @@ gboolean on_entry_key(GtkEventControllerKey *, guint keyval, guint, GdkModifierT
 
 void on_sensitivity(GObject *, GParamSpec *, gpointer)
 {
-    if (!ctrl().ui_ready || !ctrl().sens_dd) return;
+    if (idle_gate().dead.load() || !ctrl().ui_ready || !ctrl().sens_dd) return;
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctrl().sens_dd));
     if (sel > 2) return;
     ctrl().sensitivity = static_cast<int>(sel) - 1;
@@ -701,7 +745,7 @@ void on_sensitivity(GObject *, GParamSpec *, gpointer)
 
 void on_model(GObject *, GParamSpec *, gpointer)
 {
-    if (!ctrl().ui_ready || !ctrl().model_dd) return;
+    if (idle_gate().dead.load() || !ctrl().ui_ready || !ctrl().model_dd) return;
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctrl().model_dd));
     if (sel >= ctrl().model_ids.size()) return;
     if (ctrl().model_ids[sel] == ctrl().model_id) return;
@@ -713,7 +757,7 @@ void on_model(GObject *, GParamSpec *, gpointer)
 
 void on_ep(GObject *, GParamSpec *, gpointer)
 {
-    if (!ctrl().ui_ready || !ctrl().ep_dd) return;
+    if (idle_gate().dead.load() || !ctrl().ui_ready || !ctrl().ep_dd) return;
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctrl().ep_dd));
     if (sel >= ctrl().ep_ids.size()) return;
     if (ctrl().ep_ids[sel] == ctrl().ep_id) return;
@@ -724,7 +768,7 @@ void on_ep(GObject *, GParamSpec *, gpointer)
 
 void on_swatch(GtkToggleButton *button, gpointer)
 {
-    if (!ctrl().ui_ready) return;
+    if (idle_gate().dead.load() || !ctrl().ui_ready) return;
     int band = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "band"));
     if (band < 0 || band > 5) return;
     if (gtk_toggle_button_get_active(button)) ctrl().band_mask |= (1u << band);
@@ -732,7 +776,11 @@ void on_swatch(GtkToggleButton *button, gpointer)
     ctrl().paint(ctrl().last_hits);
 }
 
-void on_close_clicked(GtkButton *, gpointer) { ctrl().close_bar(); }
+void on_close_clicked(GtkButton *, gpointer)
+{
+    if (idle_gate().dead.load()) return;
+    ctrl().close_bar();
+}
 
 } /* namespace */
 
@@ -883,6 +931,7 @@ GtkWidget *semantic_search_bar_new(void)
 
 void semantic_search_toggle(void)
 {
+    if (idle_gate().dead.load()) return;
     Controller &c = ctrl();
     if (!c.revealer) return;
     if (c.open) {
@@ -898,10 +947,12 @@ void semantic_search_toggle(void)
 
 void semantic_search_note_modified(GtkWidget *sci)
 {
+    if (idle_gate().dead.load()) return;
     Controller &c = ctrl();
     if (!c.open || !sci || sci != c.sci) return;
     c.index_ready = false;
     c.build_gen.fetch_add(1);
+    c.downloads.cancel();
     c.clear_heatmap();
     c.set_status("Indexing...", true);
     c.schedule_rebuild();
@@ -909,6 +960,7 @@ void semantic_search_note_modified(GtkWidget *sci)
 
 void semantic_search_note_activated(GtkWidget *sci)
 {
+    if (idle_gate().dead.load()) return;
     Controller &c = ctrl();
     if (!c.open) return;
     c.attach(sci);
@@ -916,11 +968,12 @@ void semantic_search_note_activated(GtkWidget *sci)
 
 void semantic_search_note_closed(NppDoc *doc)
 {
-    if (!doc) return;
+    if (!doc || idle_gate().dead.load()) return;
     Controller &c = ctrl();
     if (c.doc == doc) {
         c.build_gen.fetch_add(1);
         c.query_gen.fetch_add(1);
+        c.downloads.cancel();
         /* Clear while sci is still alive, so bookmarks this feature
          * added are removed before the map entry goes away. */
         c.clear_heatmap();
@@ -930,4 +983,9 @@ void semantic_search_note_closed(NppDoc *doc)
         c.spans.clear();
     }
     c.our_bookmarks.erase(doc);
+}
+
+void semantic_search_shutdown(void)
+{
+    ctrl().shutdown();
 }

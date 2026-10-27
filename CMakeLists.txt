@@ -26,36 +26,30 @@ pkg_check_modules(GLIB2 REQUIRED glib-2.0)
 pkg_check_modules(PANGO REQUIRED pango)
 find_package(Threads REQUIRED)
 
-# Semantic search embeddings. ONNX Runtime is optional: without it the
-# editor still builds and the search bar reports that embeddings are off.
-# Weights are not part of the package; the app downloads them on first use.
-option(NPP_WITH_ONNXRUNTIME "Link ONNX Runtime for semantic search" ON)
-option(NPP_BUNDLE_ONNXRUNTIME "Install libonnxruntime into the private lib dir" OFF)
-set(ONNXRUNTIME_ROOT "" CACHE PATH "ONNX Runtime prefix (include/ and lib/)")
+# Semantic search embeddings. ONNX Runtime is loaded with dlopen at
+# startup, so the editor has no DT_NEEDED on libonnxruntime and still
+# starts when the library is absent. Weights are not part of the package;
+# the app downloads them on first use.
+option(NPP_WITH_ONNXRUNTIME "Compile the ONNX Runtime loader for semantic search" ON)
+option(NPP_BUNDLE_ONNXRUNTIME "Install ONNX Runtime and provider libraries into the private lib dir" OFF)
+set(ONNXRUNTIME_ROOT "" CACHE PATH
+    "ONNX Runtime prefix the editor searches at startup (lib/ or lib64/)")
 set(NPP_SEMANTIC_TEST_MODEL_DIR "" CACHE PATH
     "Directory with MiniLM ONNX files for semantic tests")
 
 set(NPP_HAVE_ONNXRUNTIME 0)
 if(NPP_WITH_ONNXRUNTIME)
-    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_c_api.h
-        HINTS "${ONNXRUNTIME_ROOT}/include" "$ENV{ONNXRUNTIME_ROOT}/include"
-              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/current/include"
-              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/include"
-              /opt/onnxruntime/include /usr/include /usr/local/include)
-    find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
-        HINTS "${ONNXRUNTIME_ROOT}/lib" "${ONNXRUNTIME_ROOT}/lib64"
-              "$ENV{ONNXRUNTIME_ROOT}/lib" "$ENV{ONNXRUNTIME_ROOT}/lib64"
-              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/current/lib"
-              "${CMAKE_SOURCE_DIR}/.cache/onnxruntime/lib"
-              /opt/onnxruntime/lib /usr/lib /usr/local/lib)
-    if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
-        set(NPP_HAVE_ONNXRUNTIME 1)
-        message(STATUS "ONNX Runtime: ${ONNXRUNTIME_LIBRARY}")
-    else()
-        message(STATUS "ONNX Runtime not found; semantic search embeddings disabled")
-    endif()
+    set(NPP_HAVE_ONNXRUNTIME 1)
+    message(STATUS "ONNX Runtime: dlopen at startup, no link dependency")
 else()
     message(STATUS "ONNX Runtime disabled by NPP_WITH_ONNXRUNTIME=OFF")
+endif()
+# Only an explicit CMake prefix is baked in. A runtime ONNXRUNTIME_ROOT
+# is read when the editor starts, so configure does not capture the
+# environment and hide a machine that has no library.
+set(NPP_ONNXRUNTIME_ROOT "")
+if(ONNXRUNTIME_ROOT)
+    set(NPP_ONNXRUNTIME_ROOT "${ONNXRUNTIME_ROOT}")
 endif()
 
 set(SCI_ROOT "${CMAKE_SOURCE_DIR}/scintilla")
@@ -146,19 +140,23 @@ add_library(npp_semantic STATIC
     "${SRC}/semantic/CpuSimilarityEngine.cpp"
     "${SRC}/semantic/OnnxEmbeddingProvider.cpp"
     "${SRC}/semantic/ModelZoo.cpp"
+    "${SRC}/semantic/BackgroundWorker.cpp"
+    "${SRC}/semantic/CancellableSpawn.cpp"
+    "${SRC}/semantic/OrtRuntime.cpp"
 )
 target_include_directories(npp_semantic PUBLIC
     "${SRC}/semantic"
+    "${SRC}/semantic/ort"
     ${GLIB2_INCLUDE_DIRS} ${PANGO_INCLUDE_DIRS}
 )
-target_compile_definitions(npp_semantic PUBLIC NPP_HAVE_ONNXRUNTIME=${NPP_HAVE_ONNXRUNTIME})
+target_compile_definitions(npp_semantic PUBLIC
+    NPP_HAVE_ONNXRUNTIME=${NPP_HAVE_ONNXRUNTIME}
+    "NPP_ONNXRUNTIME_ROOT=\"${NPP_ONNXRUNTIME_ROOT}\""
+)
 target_compile_options(npp_semantic PRIVATE ${GLIB2_CFLAGS_OTHER} ${PANGO_CFLAGS_OTHER})
 target_link_directories(npp_semantic PUBLIC ${GLIB2_LIBRARY_DIRS} ${PANGO_LIBRARY_DIRS})
-target_link_libraries(npp_semantic PUBLIC ${GLIB2_LIBRARIES} ${PANGO_LIBRARIES} Threads::Threads)
-if(NPP_HAVE_ONNXRUNTIME)
-    target_include_directories(npp_semantic PUBLIC "${ONNXRUNTIME_INCLUDE_DIR}")
-    target_link_libraries(npp_semantic PUBLIC "${ONNXRUNTIME_LIBRARY}")
-endif()
+target_link_libraries(npp_semantic PUBLIC
+    ${GLIB2_LIBRARIES} ${PANGO_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
 
 # -----------------------------------------------------------------------------
 # Application — nextpad-plus-plus
@@ -291,14 +289,9 @@ set_source_files_properties("${SRC}/lexilla_bridge.cpp" PROPERTIES
 # directory found via a RELOCATABLE $ORIGIN rpath, which resolves identically
 # on every distro and under any CMAKE_INSTALL_PREFIX. This also stops the
 # developer's absolute build path from being baked into shipped binaries.
-if(NPP_HAVE_ONNXRUNTIME)
-    get_filename_component(_ort_libdir "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
-    set(_npp_build_rpath "${SCI_ROOT}/bin;${_ort_libdir}")
-else()
-    set(_npp_build_rpath "${SCI_ROOT}/bin")
-endif()
+# libonnxruntime is not on this rpath. The semantic engine dlopens it.
 set_target_properties(nextpad_pp PROPERTIES
-    BUILD_RPATH   "${_npp_build_rpath}"
+    BUILD_RPATH   "${SCI_ROOT}/bin"
     INSTALL_RPATH "$ORIGIN/../lib/nextpad-plus-plus")
 
 target_link_libraries(nextpad_pp PRIVATE
@@ -331,10 +324,43 @@ install(CODE "
 # RPM-family layouts, and the $ORIGIN rpath points straight at it.
 install(FILES "${SCI_SO}" DESTINATION lib/nextpad-plus-plus)
 # Optional. Default packages do not ship libonnxruntime or model weights.
-# Turn this on only for a build that should carry the .so it linked.
-if(NPP_BUNDLE_ONNXRUNTIME AND NPP_HAVE_ONNXRUNTIME)
+# When enabled, install the real core library, a SONAME symlink, and the
+# provider plugins that live beside it. The editor dlopens the SONAME
+# from $ORIGIN/../lib/nextpad-plus-plus.
+if(NPP_BUNDLE_ONNXRUNTIME)
+    find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
+        HINTS "${ONNXRUNTIME_ROOT}/lib" "${ONNXRUNTIME_ROOT}/lib64"
+              "$ENV{ONNXRUNTIME_ROOT}/lib" "$ENV{ONNXRUNTIME_ROOT}/lib64"
+              /opt/onnxruntime/lib /usr/lib /usr/local/lib)
+    if(NOT ONNXRUNTIME_LIBRARY)
+        message(FATAL_ERROR "NPP_BUNDLE_ONNXRUNTIME=ON but libonnxruntime was not found")
+    endif()
     get_filename_component(_ort_real "${ONNXRUNTIME_LIBRARY}" REALPATH)
+    get_filename_component(_ort_dir "${_ort_real}" DIRECTORY)
+    get_filename_component(_ort_base "${_ort_real}" NAME)
+    set(_ort_soname "libonnxruntime.so.1")
+    execute_process(COMMAND readelf -d "${_ort_real}"
+        OUTPUT_VARIABLE _ort_dyn ERROR_QUIET)
+    if(_ort_dyn MATCHES "SONAME[^\n]*\\[([^]\n]+)\\]")
+        set(_ort_soname "${CMAKE_MATCH_1}")
+    endif()
+    file(GLOB _ort_providers
+        "${_ort_dir}/libonnxruntime_providers_*.so"
+        "${_ort_dir}/libonnxruntime_providers_*.so.*")
     install(FILES "${_ort_real}" DESTINATION lib/nextpad-plus-plus)
+    if(NOT _ort_base STREQUAL _ort_soname)
+        install(CODE "
+          set(_dest \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/nextpad-plus-plus\")
+          file(MAKE_DIRECTORY \"\${_dest}\")
+          if(NOT EXISTS \"\${_dest}/${_ort_soname}\")
+            execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+              \"${_ort_base}\" \"\${_dest}/${_ort_soname}\")
+          endif()
+        ")
+    endif()
+    if(_ort_providers)
+        install(FILES ${_ort_providers} DESTINATION lib/nextpad-plus-plus)
+    endif()
 endif()
 # Install the contents of resources/ directly under .../nextpad-plus-plus
 # so the tree matches RESOURCES_DIR (= NPP_RES_DIR) baked into the binary.
@@ -378,15 +404,26 @@ target_compile_definitions(npp_semantic_tests PRIVATE
     SEMANTIC_MANIFEST="${CMAKE_SOURCE_DIR}/resources/semantic/models.json"
     SEMANTIC_MODEL_DIR="${NPP_SEMANTIC_TEST_MODEL_DIR}"
 )
-if(NPP_HAVE_ONNXRUNTIME)
-    get_filename_component(_ort_libdir "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
-    set_target_properties(npp_semantic_tests PROPERTIES
-        BUILD_RPATH "${_ort_libdir}")
-endif()
 add_test(NAME semantic COMMAND npp_semantic_tests)
+
+add_executable(npp_semantic_lifecycle "${CMAKE_SOURCE_DIR}/tests/semantic/test_lifecycle.cpp")
+target_link_libraries(npp_semantic_lifecycle PRIVATE npp_semantic)
+add_test(NAME semantic-lifecycle COMMAND npp_semantic_lifecycle)
+set_tests_properties(semantic-lifecycle PROPERTIES TIMEOUT 20)
+
+add_executable(npp_ort_probe "${CMAKE_SOURCE_DIR}/tests/semantic/ort_probe.cpp")
+target_link_libraries(npp_ort_probe PRIVATE npp_semantic)
+add_test(NAME semantic-ort-probe COMMAND npp_ort_probe)
+set_tests_properties(semantic-ort-probe PROPERTIES TIMEOUT 20)
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(NAME semantic-runtime-detection
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/semantic/test_runtime_detection.py")
+    add_test(NAME semantic-ort-absent
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/semantic/test_ort_load.py"
+                $<TARGET_FILE:npp_ort_probe>
+                $<TARGET_FILE:npp_semantic_tests>
+                $<TARGET_FILE:npp_semantic_lifecycle>)
+    set_tests_properties(semantic-ort-absent PROPERTIES TIMEOUT 30)
 endif()

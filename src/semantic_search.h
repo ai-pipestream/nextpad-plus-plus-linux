@@ -25,6 +25,10 @@ void semantic_search_note_activated(GtkWidget *sci);
 /* Call while doc->sci is still alive. */
 void semantic_search_note_closed(NppDoc *doc);
 
+/* Stop indexing and model downloads, then join the worker. Call this
+ * before document widgets are destroyed. Safe to call more than once. */
+void semantic_search_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

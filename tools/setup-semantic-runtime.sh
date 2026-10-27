@@ -9,9 +9,8 @@ backend=$(python3 "$root/tools/detect-semantic-runtime.py" "${2:-auto}")
 existing=${ONNXRUNTIME_ROOT:-}
 if [[ -z "$existing" && "$backend" == jetson ]]; then
     for candidate in /opt/onnxruntime /usr/local/onnxruntime "$HOME/.local/onnxruntime" "$HOME"/ort-*; do
-        if [[ -f "$candidate/include/onnxruntime_c_api.h" &&
-              -f "$candidate/lib/libonnxruntime.so" &&
-              -f "$candidate/lib/libonnxruntime_providers_cuda.so" ]]; then
+        if [[ -f "$candidate/lib/libonnxruntime.so" || -f "$candidate/lib/libonnxruntime.so.1" ]] &&
+           [[ -f "$candidate/lib/libonnxruntime_providers_cuda.so" ]]; then
             existing=$candidate
             break
         fi
@@ -22,8 +21,8 @@ if [[ -z "$existing" && "$backend" == jetson ]]; then
     fi
 fi
 if [[ -n "$existing" ]]; then
-    [[ -f "$existing/include/onnxruntime_c_api.h" && -f "$existing/lib/libonnxruntime.so" ]] || {
-        echo 'ONNXRUNTIME_ROOT must contain include/onnxruntime_c_api.h and lib/libonnxruntime.so' >&2
+    [[ -f "$existing/lib/libonnxruntime.so" || -f "$existing/lib/libonnxruntime.so.1" ]] || {
+        echo 'ONNXRUNTIME_ROOT must contain lib/libonnxruntime.so or lib/libonnxruntime.so.1' >&2
         exit 1
     }
     existing=$(cd -- "$existing" && pwd)
@@ -32,7 +31,7 @@ if [[ -n "$existing" ]]; then
     [[ "$existing" != "$prefix/current" ]] || { echo "Using $existing"; exit 0; }
     ln -sfn "$existing" "$prefix/current"
     printf 'Using installed %s SDK: %s\n' "$backend" "$existing"
-    printf 'Configure: cmake -S "%s" -B "%s/build" -UONNXRUNTIME_INCLUDE_DIR -UONNXRUNTIME_LIBRARY -DONNXRUNTIME_ROOT="%s/current"\n' "$root" "$root" "$prefix"
+    printf 'ONNX Runtime is loaded at run time from %s (no link dependency). Export ONNXRUNTIME_ROOT="%s/current" or pass -DONNXRUNTIME_ROOT="%s/current" to CMake.\n' "$existing" "$prefix" "$prefix"
     exit 0
 fi
 case "$backend" in
@@ -59,7 +58,7 @@ mkdir -p "$package_dir/include" "$package_dir/lib"
 for header in onnxruntime_c_api.h onnxruntime_ep_c_api.h; do
     curl -fLsS "https://raw.githubusercontent.com/microsoft/onnxruntime/v$version/include/onnxruntime/core/session/$header" -o "$package_dir/include/$header"
 done
-# Keep EP plugins and their dependencies beside the linked runtime.
+# Keep EP plugins and their dependencies beside the runtime that dlopen loads.
 for library in "$runtime"/*.so*; do
     ln -sfn "$library" "$package_dir/lib/$(basename "$library")"
 done
@@ -68,4 +67,4 @@ ln -sfn "$runtime/libonnxruntime.so.$version" "$package_dir/lib/libonnxruntime.s
 # Switch only our managed link; preserve any older include/lib directories.
 ln -sfn "$package_dir" "$prefix/current"
 printf 'Selected %s (%s %s).\n' "$backend" "$package" "$version"
-printf 'Configure: cmake -S "%s" -B "%s/build" -UONNXRUNTIME_INCLUDE_DIR -UONNXRUNTIME_LIBRARY -DONNXRUNTIME_ROOT="%s/current"\n' "$root" "$root" "$prefix"
+printf 'ONNX Runtime is loaded at run time from %s/current (no link dependency). Export ONNXRUNTIME_ROOT="%s/current" or pass -DONNXRUNTIME_ROOT="%s/current" to CMake.\n' "$prefix" "$prefix" "$prefix"

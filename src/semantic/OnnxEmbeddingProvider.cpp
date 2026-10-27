@@ -1,4 +1,5 @@
 #include "ExecutionProviders.h"
+#include "OrtRuntime.h"
 #include "WordPieceTokenizer.h"
 
 #include <glib.h>
@@ -190,13 +191,12 @@ bool OnnxEmbeddingProvider::open(const OnnxProviderConfig &config, std::string &
         error = "only mean pooling is implemented";
         return false;
     }
-    if (!tok_.load(config.vocab_path, error)) return false;
-
-    ort_.api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    ort_.api = npp_ort_api(error);
     if (!ort_.api) {
-        error = "ONNX Runtime C API version mismatch";
+        if (error.empty()) error = npp_ort_missing_message();
         return false;
     }
+    if (!tok_.load(config.vocab_path, error)) return false;
     const OrtApi *api = ort_.api;
     if (!ort_.check(api->CreateEnv(ORT_LOGGING_LEVEL_ERROR, "nextpad-semantic", &ort_.env), error))
         return false;
@@ -529,19 +529,25 @@ bool OnnxEmbeddingProvider::run_items(const std::vector<TokenItem> &items, size_
 std::vector<ExecProviderInfo> execution_provider_catalog()
 {
     std::vector<ExecProviderInfo> out;
-    out.push_back({"auto", "Automatic", NPP_HAVE_ONNXRUNTIME != 0});
 #if NPP_HAVE_ONNXRUNTIME
-    const OrtApi *api = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    std::string ort_error;
+    const OrtApi *api = npp_ort_api(ort_error);
+    out.push_back({"auto", "Automatic", api != nullptr});
     std::vector<std::string> present = api ? available_ort_names(api) : std::vector<std::string>{};
     for (const KnownEp &ep : kKnown) {
         ExecProviderInfo info;
         info.id = ep.id;
         info.ort_name = ep.ort_name;
-        if (std::strcmp(ep.id, "cpu") == 0) info.runtime_present = true;
-        else info.runtime_present = name_present(present, ep.ort_name);
-        if (info.runtime_present) out.push_back(std::move(info));
+        if (std::strcmp(ep.id, "cpu") == 0) info.runtime_present = api != nullptr;
+        else info.runtime_present = api && name_present(present, ep.ort_name);
+        /* CPU stays in the list so the menu has a choice when the
+         * runtime library is not installed. GPU rows appear only when
+         * the loaded runtime advertises them. */
+        if (std::strcmp(ep.id, "cpu") == 0 || info.runtime_present)
+            out.push_back(std::move(info));
     }
 #else
+    out.push_back({"auto", "Automatic", false});
     ExecProviderInfo cpu;
     cpu.id = "cpu";
     cpu.ort_name = "CPUExecutionProvider";
@@ -559,7 +565,7 @@ std::unique_ptr<EmbeddingProvider> make_onnx_provider(const OnnxProviderConfig &
     return provider;
 #else
     (void)config;
-    error = "ONNX Runtime was not linked; semantic search embeddings are disabled";
+    error = npp_ort_missing_message();
     return nullptr;
 #endif
 }

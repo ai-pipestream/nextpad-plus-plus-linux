@@ -27,9 +27,9 @@ struct ExecProviderInfo {
     bool runtime_present = false;
 };
 
-/* Automatic and CPU are always listed. Other rows are listed only when the linked
- * ONNX Runtime reports them. With ONNX Runtime not linked, CPU is
- * listed and runtime_present is false. */
+/* Automatic and CPU are always listed. Other rows are listed only when the
+ * loaded ONNX Runtime reports them. When the runtime library is missing,
+ * CPU is listed and runtime_present is false. */
 std::vector<ExecProviderInfo> execution_provider_catalog();
 
 struct OnnxProviderConfig {

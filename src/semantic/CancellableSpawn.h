@@ -10,6 +10,8 @@
 #define NPP_CANCELLABLE_SPAWN_H
 
 #include <atomic>
+#include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -30,10 +32,15 @@ public:
     void retire();
     bool retired() const { return retired_.load(); }
 
+    /* Called after this run samples the cancel generation and before it
+     * takes the lock. Tests use it to cancel in that window. */
+    void set_pre_lock_hook(std::function<void()> hook);
+
 private:
     std::mutex mu_;
-    std::atomic<bool> abort_{false};
+    std::atomic<uint64_t> cancel_gen_{0};
     std::atomic<bool> retired_{false};
+    std::function<void()> pre_lock_hook_;
     int pid_ = 0;
 };
 

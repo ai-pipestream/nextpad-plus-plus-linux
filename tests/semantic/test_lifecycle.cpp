@@ -185,6 +185,51 @@ void deliver(HeatmapScreen &screen, bool dead,
     }
 }
 
+void test_on_stop_runs_on_worker()
+{
+    BackgroundWorker worker;
+    std::atomic<int> started{0};
+    std::atomic<int> job_finished{0};
+    std::thread::id job_thread;
+    std::thread::id stop_thread;
+    std::atomic<bool> stop_after_job{false};
+
+    worker.post([&] {
+        job_thread = std::this_thread::get_id();
+        started.store(1);
+        while (!worker.stopping())
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        job_finished.store(1);
+    });
+    expect(wait_until(started, 1, std::chrono::seconds(2)), "worker job did not start");
+    worker.set_on_stop([&] {
+        stop_thread = std::this_thread::get_id();
+        stop_after_job.store(job_finished.load() == 1);
+    });
+    worker.shutdown();
+    expect(stop_after_job.load(), "stop callback ran before the job returned");
+    expect(stop_thread == job_thread, "stop callback was not on the worker thread");
+    expect(stop_thread != std::this_thread::get_id(), "stop callback ran on the caller");
+}
+
+void test_cancel_before_lock()
+{
+    CancellableSpawn spawn;
+    spawn.set_pre_lock_hook([&spawn] { spawn.cancel(); });
+    auto start = clock::now();
+    CancellableSpawn::Result result = spawn.run({"sleep", "30"});
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - start);
+    expect(result.cancelled, "cancel before the lock was ignored");
+    expect(!result.started, "a process was started after cancel");
+    expect(elapsed < std::chrono::seconds(1),
+           "cancel before the lock waited " + std::to_string(elapsed.count()) + " ms");
+
+    spawn.set_pre_lock_hook({});
+    CancellableSpawn::Result again = spawn.run({"true"});
+    expect(!again.cancelled && again.exited && again.exit_code == 0,
+           "an earlier cancel stuck to the next run");
+}
+
 void test_stale_query_colours()
 {
     HeatmapScreen screen;
@@ -233,6 +278,8 @@ int main()
 {
     test_quit_during_download();
     test_quit_during_embed();
+    test_on_stop_runs_on_worker();
+    test_cancel_before_lock();
     test_stale_query_colours();
     if (g_fails) {
         std::cerr << g_fails << " failure(s)\n";

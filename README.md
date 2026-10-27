@@ -248,10 +248,39 @@ CUDA/cuDNN. Runtime versions alone do not prove GPU compatibility.
 
 Semantic search defaults to **Automatic** execution and fp32 MiniLM. Automatic
 tries CUDA, then OpenVINO GPU, then CPU, within the loaded runtime's available
-providers. It verifies real inference; failed, non-finite, or invalid GPU output
-retries on CPU. OpenVINO uses GPU/FP32 and CUDA disables TF32 for score parity.
+providers. It verifies real inference. A GPU failure part way through a document
+discards the vectors already produced and embeds the whole document again on
+CPU, so GPU and CPU vectors are not mixed. OpenVINO uses GPU/FP32 and CUDA
+disables TF32 for score parity.
 Existing saved choices are preserved; select Automatic for an existing profile.
-The status line names the active backend.
+
+The status line names the backend that is actually running, including while
+batches are still in progress. It reads `Indexing N of M... · <backend>` and,
+when the index is ready, `N of M sentences indexed · <model> · <backend>`, for
+example `29 of 29 sentences indexed · MiniLM-L6 fp32 · ONNX Runtime CPU`.
+Automatic on a CPU-only runtime shows `ONNX Runtime CPU`. The suffix
+`(GPU unavailable)` is added only when CUDA or OpenVINO was selected and that
+provider could not be used. After a GPU failure during indexing the backend
+reads `ONNX Runtime CPU (GPU inference failed)`.
+
+If the selected model is not on disk, the status names its id and says it is
+not installed and that the download needs a network connection. If `curl` is
+missing, the same message says curl is required. A cancelled download does not
+replace the status text.
+
+Cloned views share one Scintilla document. An edit in either view refreshes
+the semantic index, and the heatmap is drawn on that shared document. Closing
+one of two clones leaves the heatmap and the bookmarks semantic search added.
+Closing the last view of the document removes only those bookmarks. Bookmarks
+are tracked by marker handle, so an edit that moves lines does not make a
+later removal delete a different line.
+
+The heatmap indicator comes from the host indicator allocator
+(`NPPM_ALLOCATEINDICATOR`). The allocator starts at indicator 9 and skips
+indicator 9 (incremental search) and indicator 19 (clickable links), so the
+first slot it hands out is 10. It does not reserve indicator 20. The search
+bar is created before plugins load and takes that first slot. A plugin request
+that fits in the gaps around indicators 9 and 19 still succeeds.
 
 Colour calibration belongs to the **model**, not the CPU/GPU. Every manifest
 entry declares `heatmap_profile`; the current MiniLM exports use `minilm` on all

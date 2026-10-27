@@ -51,7 +51,7 @@ bool parse_file(const Json &node, ModelFile &file, std::string &error)
 }
 
 bool download_url(const std::string &url, const std::string &dest,
-                  CancellableSpawn &spawn, std::string &error)
+                  const std::string &model_id, CancellableSpawn &spawn, std::string &error)
 {
     std::string partial = dest + ".partial";
     if (spawn.retired()) {
@@ -72,14 +72,12 @@ bool download_url(const std::string &url, const std::string &dest,
         return false;
     }
     if (!result.started || !result.spawn_error.empty()) {
-        error = result.spawn_error.empty() ? "could not run curl" : result.spawn_error;
+        error = ModelZoo::download_failure_message(model_id, !result.started);
         g_unlink(partial.c_str());
         return false;
     }
     if (!result.exited || result.exit_code != 0) {
-        error = result.stderr_text.empty()
-                    ? "download failed"
-                    : std::string("download failed: ") + result.stderr_text;
+        error = ModelZoo::download_failure_message(model_id, false);
         g_unlink(partial.c_str());
         return false;
     }
@@ -92,7 +90,7 @@ bool download_url(const std::string &url, const std::string &dest,
 }
 
 bool ensure_one(const ModelFile &file, const std::string &dest_dir,
-                CancellableSpawn &spawn, std::string &error)
+                const std::string &model_id, CancellableSpawn &spawn, std::string &error)
 {
     std::string dest = dest_dir + "/" + file.filename;
     std::string hex;
@@ -101,7 +99,7 @@ bool ensure_one(const ModelFile &file, const std::string &dest_dir,
         if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) == 0) return true;
         g_unlink(dest.c_str());
     }
-    if (!download_url(file.url, dest, spawn, error)) return false;
+    if (!download_url(file.url, dest, model_id, spawn, error)) return false;
     if (!ModelZoo::file_sha256(dest, hex, error)) return false;
     if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) != 0) {
         g_unlink(dest.c_str());
@@ -201,8 +199,13 @@ bool ModelZoo::load_file(const std::string &path, std::string &error)
         const Json *arch_node = model->field(arch);
         if (!arch_node) arch_node = model->field("all");
         if (!arch_node) {
-            error = "model " + spec.id + " has no file for " + arch;
-            return false;
+            /* Skip a model this machine cannot run. The default is
+             * required, and an empty list is still an error. */
+            if (spec.id == def->str) {
+                error = "default model " + spec.id + " has no file for " + arch;
+                return false;
+            }
+            continue;
         }
         if (!parse_file(*arch_node, spec.model, error)) return false;
         parsed.push_back(std::move(spec));
@@ -239,7 +242,17 @@ bool ModelZoo::ensure(const ModelSpec &spec, const std::string &dest_dir, std::s
         error = "could not create " + dest_dir;
         return false;
     }
-    if (!ensure_one(spec.vocab, dest_dir, *spawn, error)) return false;
-    if (!ensure_one(spec.model, dest_dir, *spawn, error)) return false;
+    if (!ensure_one(spec.vocab, dest_dir, spec.id, *spawn, error)) return false;
+    if (!ensure_one(spec.model, dest_dir, spec.id, *spawn, error)) return false;
     return true;
+}
+
+std::string ModelZoo::download_failure_message(const std::string &model_id, bool curl_missing)
+{
+    if (curl_missing) {
+        return "Model " + model_id +
+               " is not installed. Downloading it needs curl and a network connection.";
+    }
+    return "Model " + model_id +
+           " is not installed. Downloading it needs a network connection.";
 }

@@ -17,6 +17,12 @@ void BackgroundWorker::post(std::function<void()> fn)
     cv_.notify_one();
 }
 
+void BackgroundWorker::set_on_stop(std::function<void()> fn)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    on_stop_ = std::move(fn);
+}
+
 void BackgroundWorker::shutdown()
 {
     {
@@ -45,6 +51,9 @@ void BackgroundWorker::loop()
              * so process exit does not run work that touches freed state. */
             if (stop_) {
                 queue_.clear();
+                fn = std::move(on_stop_);
+                lock.unlock();
+                if (fn) fn();
                 return;
             }
             fn = std::move(queue_.front());

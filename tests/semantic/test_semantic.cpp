@@ -664,13 +664,18 @@ void test_model_files_reused()
     spec.model = {"model.onnx", "file://" + source, hash};
     CancellableSpawn spawn;
     int children = 0;
+    int download_notifications = 0;
     spawn.set_pre_lock_hook([&] { ++children; });
     ModelZoo zoo;
-    expect(zoo.ensure(spec, root + "/cache", error, &spawn), error);
+    expect(zoo.ensure(spec, root + "/cache", error, &spawn, std::nullopt,
+                      [&] { ++download_notifications; }), error);
     expect(children == 2, "first installation downloads vocabulary and model once");
+    expect(download_notifications == 2, "both real transfers report downloading");
     std::remove(source.c_str()); // the source is no longer available
-    expect(zoo.ensure(spec, root + "/cache", error, &spawn), error);
+    expect(zoo.ensure(spec, root + "/cache", error, &spawn, std::nullopt,
+                      [&] { ++download_notifications; }), error);
     expect(children == 2, "verified model files are reused without any network request");
+    expect(download_notifications == 2, "cached files do not report a download");
     std::remove((root + "/cache/vocab.txt").c_str());
     std::remove((root + "/cache/model.onnx").c_str());
     g_rmdir((root + "/cache").c_str());

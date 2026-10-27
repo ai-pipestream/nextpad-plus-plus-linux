@@ -135,6 +135,12 @@ struct Controller {
     std::string loaded_ep;
     std::string backend_name = "ONNX Runtime CPU";
 
+    // UI-thread state: document messages must not hide an active download.
+    std::string requested_status;
+    bool requested_busy = false;
+    std::optional<CancellableSpawn::Ticket> downloading_ticket;
+    std::string downloading_status;
+
     sptr_t send(GtkWidget *w, unsigned msg, uptr_t wp, sptr_t lp)
     {
         return scintilla_send_message(SCINTILLA(w), msg, wp, lp);
@@ -142,6 +148,16 @@ struct Controller {
 
     void set_status(const std::string &text, bool busy)
     {
+        requested_status = text;
+        requested_busy = busy;
+        render_status();
+    }
+
+    void render_status()
+    {
+        bool downloading = downloading_ticket && !downloads.cancelled(*downloading_ticket);
+        const std::string &text = downloading ? downloading_status : requested_status;
+        bool busy = downloading || requested_busy;
         if (status) {
             gtk_label_set_text(GTK_LABEL(status), text.c_str());
             gtk_widget_set_tooltip_text(status, text.c_str());
@@ -492,16 +508,23 @@ struct Controller {
             return false;
         }
         std::string dir = storage_dir(spec->id);
-        std::string model_path = dir + "/" + spec->model.filename;
-        bool have_model = g_file_test(model_path.c_str(), G_FILE_TEST_IS_REGULAR);
-        if (!have_model) {
-            std::string name = spec->name;
+        std::string name = spec->name;
+        bool installed = zoo.ensure(*spec, dir, error, &downloads, ticket, [this, ticket, name] {
             post_main([this, ticket, name] {
-                if (idle_gate().dead.load() || downloads.cancelled(ticket) || !open) return;
-                set_status("Downloading " + name + "...", true);
+                if (downloads.cancelled(ticket) || !open) return;
+                downloading_ticket = ticket;
+                downloading_status = "Downloading " + name + "...";
+                render_status();
             });
-        }
-        if (!zoo.ensure(*spec, dir, error, &downloads, ticket)) return false;
+        });
+        post_main([this, ticket] {
+            // An older completion must not clear a newer model's status.
+            if (downloading_ticket != ticket) return;
+            downloading_ticket.reset();
+            downloading_status.clear();
+            render_status();
+        });
+        if (!installed) return false;
         if (downloads.cancelled(ticket)) { error = "cancelled"; return false; }
         OnnxProviderConfig cfg;
         cfg.model_path = dir + "/" + spec->model.filename;
@@ -1157,7 +1180,10 @@ void semantic_search_note_closed(NppDoc *closing)
      * is still alive, and do it only on this close. */
     c.build_gen.fetch_add(1);
     c.query_gen.fetch_add(1);
-    c.downloads.cancel();
+    // A model belongs to the search feature, not the tab being closed.
+    bool another_tab = std::any_of(open_docs.begin(), open_docs.end(),
+                                  [closing](NppDoc *d) { return d != closing; });
+    if (!another_tab) c.downloads.cancel();
     if (!c.sci) c.sci = closing->sci;
     c.clear_heatmap();
     c.track.apply_close(result);

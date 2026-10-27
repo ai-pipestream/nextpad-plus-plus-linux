@@ -271,7 +271,12 @@ If curl cannot start, the status asks you to check its installation. Cancellatio
 covers both vocabulary and model downloads. Typing and switching documents do
 not cancel a download for the current model/backend. Only the newest pending
 document snapshot is retained while that download runs. Changing model/backend,
-closing search, closing the last tracked document view, or quitting cancels it.
+closing search, closing the last open editor tab, or quitting cancels it.
+Closing one tab while others remain keeps the transfer running. The status
+continues to say "Downloading…" through edits and tab changes until the transfer
+finishes. Transfers have a 30-second connection timeout and stop after 60 seconds
+below one byte per second, rather than a total duration cap; slow connections
+can finish the model download.
 Verified model files remain on disk across launches. The loaded provider and
 unchanged-sentence embeddings are reused across edits and search-bar reopen;
 a model/backend change replaces the provider. Memory is released at shutdown.

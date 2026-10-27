@@ -51,18 +51,22 @@ bool parse_file(const Json &node, ModelFile &file, std::string &error)
 }
 
 bool download_url(const std::string &url, const std::string &dest,
-                  const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error)
+                  const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error,
+                  const std::function<void()> &on_download)
 {
     std::string partial = dest + ".partial";
     if (spawn.cancelled(ticket)) {
         error = "cancelled";
         return false;
     }
+    if (on_download) on_download();
     CancellableSpawn::Result result = spawn.run({
         "curl", "-fsSL",
         "--retry", "3",
         "--retry-delay", "1",
-        "--max-time", "180",
+        "--connect-timeout", "30",
+        "--speed-limit", "1",
+        "--speed-time", "60",
         "-o", partial,
         url
     }, ticket);
@@ -94,7 +98,8 @@ bool download_url(const std::string &url, const std::string &dest,
 }
 
 bool ensure_one(const ModelFile &file, const std::string &dest_dir,
-                const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error)
+                const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error,
+                  const std::function<void()> &on_download)
 {
     if (spawn.cancelled(ticket)) { error = "cancelled"; return false; }
     std::string dest = dest_dir + "/" + file.filename;
@@ -104,7 +109,7 @@ bool ensure_one(const ModelFile &file, const std::string &dest_dir,
         if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) == 0) return true;
         g_unlink(dest.c_str());
     }
-    if (!download_url(file.url, dest, model_id, spawn, ticket, error)) return false;
+    if (!download_url(file.url, dest, model_id, spawn, ticket, error, on_download)) return false;
     if (!ModelZoo::file_sha256(dest, hex, error)) return false;
     if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) != 0) {
         g_unlink(dest.c_str());
@@ -239,7 +244,8 @@ const ModelSpec *ModelZoo::find(const std::string &id) const
 }
 
 bool ModelZoo::ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error,
-                      CancellableSpawn *spawn, std::optional<CancellableSpawn::Ticket> requested_ticket) const
+                      CancellableSpawn *spawn, std::optional<CancellableSpawn::Ticket> requested_ticket,
+                      const std::function<void()> &on_download) const
 {
     CancellableSpawn local;
     if (!spawn) spawn = &local;
@@ -249,8 +255,8 @@ bool ModelZoo::ensure(const ModelSpec &spec, const std::string &dest_dir, std::s
         error = "could not create " + dest_dir;
         return false;
     }
-    if (!ensure_one(spec.vocab, dest_dir, spec.id, *spawn, ticket, error)) return false;
-    if (!ensure_one(spec.model, dest_dir, spec.id, *spawn, ticket, error)) return false;
+    if (!ensure_one(spec.vocab, dest_dir, spec.id, *spawn, ticket, error, on_download)) return false;
+    if (!ensure_one(spec.model, dest_dir, spec.id, *spawn, ticket, error, on_download)) return false;
     return true;
 }
 

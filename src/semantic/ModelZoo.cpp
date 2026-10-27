@@ -51,35 +51,41 @@ bool parse_file(const Json &node, ModelFile &file, std::string &error)
 }
 
 bool download_url(const std::string &url, const std::string &dest,
-                  CancellableSpawn &spawn, std::string &error)
+                  const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error,
+                  const std::function<void()> &on_download)
 {
     std::string partial = dest + ".partial";
-    if (spawn.retired()) {
+    if (spawn.cancelled(ticket)) {
         error = "cancelled";
         return false;
     }
+    if (on_download) on_download();
     CancellableSpawn::Result result = spawn.run({
-        "curl", "-fL",
+        "curl", "-fsSL",
         "--retry", "3",
         "--retry-delay", "1",
-        "--max-time", "180",
+        "--connect-timeout", "30",
+        "--speed-limit", "1",
+        "--speed-time", "60",
         "-o", partial,
         url
-    });
-    if (result.cancelled || spawn.retired()) {
+    }, ticket);
+    if (result.cancelled || spawn.cancelled(ticket)) {
         g_unlink(partial.c_str());
         error = "cancelled";
         return false;
     }
     if (!result.started || !result.spawn_error.empty()) {
-        error = result.spawn_error.empty() ? "could not run curl" : result.spawn_error;
+        g_message("Semantic model %s: curl could not start: %s", model_id.c_str(),
+                  result.spawn_error.c_str());
+        error = ModelZoo::download_failure_message(model_id, !result.started);
         g_unlink(partial.c_str());
         return false;
     }
     if (!result.exited || result.exit_code != 0) {
-        error = result.stderr_text.empty()
-                    ? "download failed"
-                    : std::string("download failed: ") + result.stderr_text;
+        g_message("Semantic model %s: curl exit %d: %s", model_id.c_str(),
+                  result.exit_code, result.stderr_text.c_str());
+        error = ModelZoo::download_failure_message(model_id, false, result.exit_code);
         g_unlink(partial.c_str());
         return false;
     }
@@ -92,8 +98,10 @@ bool download_url(const std::string &url, const std::string &dest,
 }
 
 bool ensure_one(const ModelFile &file, const std::string &dest_dir,
-                CancellableSpawn &spawn, std::string &error)
+                const std::string &model_id, CancellableSpawn &spawn, CancellableSpawn::Ticket ticket, std::string &error,
+                  const std::function<void()> &on_download)
 {
+    if (spawn.cancelled(ticket)) { error = "cancelled"; return false; }
     std::string dest = dest_dir + "/" + file.filename;
     std::string hex;
     if (g_file_test(dest.c_str(), G_FILE_TEST_IS_REGULAR)) {
@@ -101,7 +109,7 @@ bool ensure_one(const ModelFile &file, const std::string &dest_dir,
         if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) == 0) return true;
         g_unlink(dest.c_str());
     }
-    if (!download_url(file.url, dest, spawn, error)) return false;
+    if (!download_url(file.url, dest, model_id, spawn, ticket, error, on_download)) return false;
     if (!ModelZoo::file_sha256(dest, hex, error)) return false;
     if (g_ascii_strcasecmp(hex.c_str(), file.sha256.c_str()) != 0) {
         g_unlink(dest.c_str());
@@ -201,8 +209,13 @@ bool ModelZoo::load_file(const std::string &path, std::string &error)
         const Json *arch_node = model->field(arch);
         if (!arch_node) arch_node = model->field("all");
         if (!arch_node) {
-            error = "model " + spec.id + " has no file for " + arch;
-            return false;
+            /* Skip a model this machine cannot run. The default is
+             * required, and an empty list is still an error. */
+            if (spec.id == def->str) {
+                error = "default model " + spec.id + " has no file for " + arch;
+                return false;
+            }
+            continue;
         }
         if (!parse_file(*arch_node, spec.model, error)) return false;
         parsed.push_back(std::move(spec));
@@ -231,15 +244,35 @@ const ModelSpec *ModelZoo::find(const std::string &id) const
 }
 
 bool ModelZoo::ensure(const ModelSpec &spec, const std::string &dest_dir, std::string &error,
-                      CancellableSpawn *spawn) const
+                      CancellableSpawn *spawn, std::optional<CancellableSpawn::Ticket> requested_ticket,
+                      const std::function<void()> &on_download) const
 {
     CancellableSpawn local;
     if (!spawn) spawn = &local;
+    const auto ticket = requested_ticket.value_or(spawn->ticket());
+    if (spawn->cancelled(ticket)) { error = "cancelled"; return false; }
     if (g_mkdir_with_parents(dest_dir.c_str(), 0700) != 0) {
         error = "could not create " + dest_dir;
         return false;
     }
-    if (!ensure_one(spec.vocab, dest_dir, *spawn, error)) return false;
-    if (!ensure_one(spec.model, dest_dir, *spawn, error)) return false;
+    if (!ensure_one(spec.vocab, dest_dir, spec.id, *spawn, ticket, error, on_download)) return false;
+    if (!ensure_one(spec.model, dest_dir, spec.id, *spawn, ticket, error, on_download)) return false;
     return true;
+}
+
+std::string ModelZoo::download_failure_message(const std::string &model_id, bool curl_missing,
+                                                int exit_code)
+{
+    std::string reason;
+    if (curl_missing) reason = "Could not start curl; check that it is installed.";
+    else switch (exit_code) {
+    case 5: case 6: case 7: reason = "Could not connect; check the network and server address."; break;
+    case 22: reason = "The server returned an HTTP error (for example 404 or 403)."; break;
+    case 23: reason = "Could not write the download; check disk space and permissions."; break;
+    case 28: reason = "The download timed out."; break;
+    case 35: case 51: case 60: case 77: reason = "TLS connection or certificate verification failed."; break;
+    case 37: reason = "The source file could not be read."; break;
+    default: reason = "Download failed (curl exit " + std::to_string(exit_code) + ")."; break;
+    }
+    return "Model " + model_id + " is not installed. " + reason;
 }

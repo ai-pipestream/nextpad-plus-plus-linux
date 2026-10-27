@@ -1,4 +1,5 @@
 #include "ExecutionProviders.h"
+#include "EmbedFallback.h"
 #include "OrtRuntime.h"
 #include "WordPieceTokenizer.h"
 
@@ -110,6 +111,7 @@ public:
     int max_tokens() const override { return max_tokens_; }
     bool available() const override { return ready_; }
     std::string backend_name() const override { return backend_; }
+    uint64_t backend_generation() const override { return backend_generation_; }
 
     size_t token_count(const std::string &text) const override
     {
@@ -140,6 +142,7 @@ private:
     std::string backend_;
     std::string model_path_;
     bool using_gpu_ = false;
+    uint64_t backend_generation_ = 0;
 };
 
 bool OnnxEmbeddingProvider::make_options(bool try_gpu, const KnownEp *want, std::string &error)
@@ -235,9 +238,7 @@ bool OnnxEmbeddingProvider::open(const OnnxProviderConfig &config, std::string &
     if (!collect_io(error)) return false;
 
     using_gpu_ = used_gpu;
-    backend_ = used_gpu ? std::string("ONNX Runtime ") + want->id + " GPU"
-                        : "ONNX Runtime CPU";
-    if (!used_gpu && requested != "cpu") backend_ += " (GPU unavailable)";
+    backend_ = onnx_backend_label(used_gpu, requested, used_gpu && want ? want->id : nullptr);
     ready_ = true;
     // Session creation alone does not prove that dynamic GPU inference works.
     if (using_gpu_) {
@@ -251,6 +252,7 @@ bool OnnxEmbeddingProvider::open(const OnnxProviderConfig &config, std::string &
 bool OnnxEmbeddingProvider::fallback_cpu(std::string &error)
 {
     using_gpu_ = false;
+    ++backend_generation_;
     if (ort_.session) ort_.api->ReleaseSession(ort_.session);
     ort_.session = nullptr;
     ort_.input_names.clear();
@@ -262,7 +264,7 @@ bool OnnxEmbeddingProvider::fallback_cpu(std::string &error)
         ready_ = false;
         return false;
     }
-    backend_ = "ONNX Runtime CPU (GPU inference failed)";
+    backend_ = onnx_cpu_fallback_label();
     return true;
 }
 
@@ -327,23 +329,21 @@ bool OnnxEmbeddingProvider::embed_batch(const std::vector<std::string> &texts,
     std::sort(items.begin(), items.end(),
               [](const TokenItem &a, const TokenItem &b) { return a.ids.size() < b.ids.size(); });
     out.assign(texts.size() * static_cast<size_t>(dim_), 0.f);
-    for (size_t base = 0; base < items.size(); base += kBatchSize) {
-        size_t n = std::min(kBatchSize, items.size() - base);
-        if (!run_items(items, base, n, out, error)) {
-            if (!using_gpu_ || !fallback_cpu(error) || !run_items(items, base, n, out, error))
-                return false;
-        }
-        if (progress) {
-            std::vector<size_t> done;
-            done.reserve(n);
-            for (size_t k = 0; k < n; ++k) done.push_back(items[base + k].orig);
-            if (!progress(done)) {
-                error = "cancelled";
-                return false;
-            }
-        }
-    }
-    return true;
+    return run_embed_batches(
+        items.size(), kBatchSize, using_gpu_,
+        [&](size_t base, size_t n, std::vector<size_t> &indexes, std::string &err) {
+            if (!run_items(items, base, n, out, err)) return false;
+            indexes.clear();
+            indexes.reserve(n);
+            for (size_t k = 0; k < n; ++k) indexes.push_back(items[base + k].orig);
+            return true;
+        },
+        [&](std::string &err) {
+            /* Drop vectors already written by earlier GPU batches. */
+            out.assign(texts.size() * static_cast<size_t>(dim_), 0.f);
+            return fallback_cpu(err);
+        },
+        progress, error);
 }
 
 bool OnnxEmbeddingProvider::run_items(const std::vector<TokenItem> &items, size_t base, size_t n,
@@ -525,6 +525,19 @@ bool OnnxEmbeddingProvider::run_items(const std::vector<TokenItem> &items, size_
 #endif /* NPP_HAVE_ONNXRUNTIME */
 
 } /* namespace */
+
+std::string onnx_backend_label(bool used_gpu, const std::string &requested, const char *gpu_id)
+{
+    std::string key = requested;
+    for (char &ch : key)
+        if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    if (key.empty()) key = "auto";
+    const bool automatic = key == "auto";
+    std::string backend = (used_gpu && gpu_id) ? std::string("ONNX Runtime ") + gpu_id + " GPU"
+                                               : "ONNX Runtime CPU";
+    if (!used_gpu && !automatic && key != "cpu") backend += " (GPU unavailable)";
+    return backend;
+}
 
 std::vector<ExecProviderInfo> execution_provider_catalog()
 {

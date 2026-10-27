@@ -10,6 +10,8 @@
 #define NPP_CANCELLABLE_SPAWN_H
 
 #include <atomic>
+#include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -25,15 +27,23 @@ public:
         std::string spawn_error;
     };
 
-    Result run(const std::vector<std::string> &args);
+    using Ticket = uint64_t;
+    Ticket ticket() const { return cancel_gen_.load(); }
+    bool cancelled(Ticket ticket) const { return retired_.load() || cancel_gen_.load() != ticket; }
+    Result run(const std::vector<std::string> &args) { return run(args, ticket()); }
+    Result run(const std::vector<std::string> &args, Ticket ticket);
     void cancel();
     void retire();
     bool retired() const { return retired_.load(); }
 
+    /* Called before the launch lock. Tests use it to cancel in that window. */
+    void set_pre_lock_hook(std::function<void()> hook);
+
 private:
     std::mutex mu_;
-    std::atomic<bool> abort_{false};
+    std::atomic<uint64_t> cancel_gen_{0};
     std::atomic<bool> retired_{false};
+    std::function<void()> pre_lock_hook_;
     int pid_ = 0;
 };
 

@@ -3131,6 +3131,7 @@ void editor_clone_to_view(gboolean vertical)
     /* Share the document buffer (Scintilla ref-counts it). */
     sptr_t docptr = sci_msg(src->sci, SCI_GETDOCPOINTER, 0, 0);
     sci_msg(sci, SCI_SETDOCPOINTER, 0, docptr);
+    semantic_search_configure_view(sci);
     g_signal_connect(sci, "sci-notify", G_CALLBACK(on_sci_notify), NULL);
     if (doc->language && doc->language[0]) {
         g_object_set_data_full(G_OBJECT(sci), "npp-lang",

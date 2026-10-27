@@ -1,13 +1,18 @@
 #include "semantic_search.h"
 
 #include "paths.h"
+#include "docmap.h"
+#include "split.h"
 #include "sci_c.h"
 
 #include "BackgroundWorker.h"
+#include "BackendConsistency.h"
 #include "CancellableSpawn.h"
+#include "DocumentTrack.h"
 #include "ExecutionProviders.h"
 #include "HeatmapApply.h"
 #include "ModelZoo.h"
+#include "OrtRuntime.h"
 #include "SemanticHeatmapColors.h"
 #include "SentenceSplitter.h"
 
@@ -17,7 +22,6 @@
 #include <atomic>
 #include <cstdio>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -27,7 +31,6 @@
 
 namespace {
 
-constexpr int kIndicator = 20;
 constexpr long kMaxBytes = 2L * 1024L * 1024L;
 constexpr size_t kMaxSentences = 4096;
 constexpr unsigned kQueryDebounceMs = 300;
@@ -113,13 +116,16 @@ struct Controller {
     std::string query;
     std::string index_status;
     std::vector<SemanticHit> last_hits;
-    std::map<NppDoc *, std::set<int>> our_bookmarks;
+    DocumentTrack track;
+    /* Slot from npp_alloc_one_indicator(). Negative until the bar is built. */
+    int indicator = -1;
 
     std::atomic<uint64_t> build_gen{0};
     std::atomic<uint64_t> query_gen{0};
     guint query_timer = 0;
     guint rebuild_timer = 0;
 
+    MarkerSyncState bookmark_state;
     ModelZoo zoo;
     std::unique_ptr<EmbeddingProvider> provider;
     std::unique_ptr<SimilarityEngine> engine;
@@ -129,6 +135,12 @@ struct Controller {
     std::string loaded_ep;
     std::string backend_name = "ONNX Runtime CPU";
 
+    // UI-thread state: document messages must not hide an active download.
+    std::string requested_status;
+    bool requested_busy = false;
+    std::optional<CancellableSpawn::Ticket> downloading_ticket;
+    std::string downloading_status;
+
     sptr_t send(GtkWidget *w, unsigned msg, uptr_t wp, sptr_t lp)
     {
         return scintilla_send_message(SCINTILLA(w), msg, wp, lp);
@@ -136,6 +148,16 @@ struct Controller {
 
     void set_status(const std::string &text, bool busy)
     {
+        requested_status = text;
+        requested_busy = busy;
+        render_status();
+    }
+
+    void render_status()
+    {
+        bool downloading = downloading_ticket && !downloads.cancelled(*downloading_ticket);
+        const std::string &text = downloading ? downloading_status : requested_status;
+        bool busy = downloading || requested_busy;
         if (status) {
             gtk_label_set_text(GTK_LABEL(status), text.c_str());
             gtk_widget_set_tooltip_text(status, text.c_str());
@@ -179,38 +201,65 @@ struct Controller {
         g_free(path);
     }
 
-    void configure_indicator()
+    void configure_indicator_on(GtkWidget *w)
     {
-        if (!sci) return;
+        if (!w || indicator < 0) return;
         /* Full-box indicators go through Surface::AlphaRectangle. The GTK4
          * Scintilla surface still stubs that call, so a wash would not
          * paint. Text foreground uses the same per-sentence colour and
          * does draw. */
-        send(sci, SCI_INDICSETSTYLE, kIndicator, INDIC_TEXTFORE);
-        send(sci, SCI_INDICSETFLAGS, kIndicator, SC_INDICFLAG_VALUEFORE);
+        send(w, SCI_INDICSETSTYLE, static_cast<uptr_t>(indicator), INDIC_TEXTFORE);
+        send(w, SCI_INDICSETFLAGS, static_cast<uptr_t>(indicator), SC_INDICFLAG_VALUEFORE);
+    }
+
+    void configure_indicator()
+    {
+        if (indicator < 0) return;
+        if (sci) configure_indicator_on(sci);
+        configure_indicator_on(docmap_scintilla());
+        split_foreach_sci(semantic_search_configure_view);
+        if (!track.active()) return;
+        /* Indicator style is per view. Every clone of this document
+         * needs the same text-foreground style or the shared ranges
+         * do not show there. */
+        GPtrArray *docs = editor_all_docs();
+        if (!docs) return;
+        for (guint i = 0; i < docs->len; ++i) {
+            auto *d = static_cast<NppDoc *>(g_ptr_array_index(docs, i));
+            if (!d || !d->sci || d->sci == sci) continue;
+            if (doc_pointer(d->sci) != track.doc()) continue;
+            configure_indicator_on(d->sci);
+        }
+        g_ptr_array_free(docs, TRUE);
+    }
+
+    std::uintptr_t doc_pointer(GtkWidget *w)
+    {
+        if (!w) return 0;
+        return static_cast<std::uintptr_t>(send(w, SCI_GETDOCPOINTER, 0, 0));
     }
 
     void sync_bookmarks(const std::set<int> &want)
     {
-        if (!sci || !doc) return;
+        if (!sci) return;
         const int marker = SC_MARKNUM_BOOKMARK;
         const unsigned mask = 1u << marker;
-        std::set<int> &ours = our_bookmarks[doc];
-        for (auto it = ours.begin(); it != ours.end();) {
-            if (!want.count(*it)) {
-                send(sci, SCI_MARKERDELETE, static_cast<uptr_t>(*it), marker);
-                it = ours.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        for (int line : want) {
-            if (ours.count(line)) continue;
-            if (static_cast<unsigned>(send(sci, SCI_MARKERGET, static_cast<uptr_t>(line), 0)) & mask)
-                continue;
-            send(sci, SCI_MARKERADD, static_cast<uptr_t>(line), marker);
-            ours.insert(line);
-        }
+        GtkWidget *w = sci;
+        MarkerFns fns;
+        fns.line_from_handle = [this, w](int handle) {
+            return static_cast<int>(send(w, SCI_MARKERLINEFROMHANDLE,
+                                         static_cast<uptr_t>(handle), 0));
+        };
+        fns.delete_handle = [this, w](int handle) {
+            send(w, SCI_MARKERDELETEHANDLE, static_cast<uptr_t>(handle), 0);
+        };
+        fns.mask_on_line = [this, w](int line) {
+            return static_cast<unsigned>(send(w, SCI_MARKERGET, static_cast<uptr_t>(line), 0));
+        };
+        fns.add_on_line = [this, w](int line) {
+            return static_cast<int>(send(w, SCI_MARKERADD, static_cast<uptr_t>(line), marker));
+        };
+        sync_marker_handles(track.handles(), want, mask, fns, &bookmark_state);
     }
 
     SemanticHeatmap::Profile heatmap_profile() const
@@ -239,8 +288,10 @@ struct Controller {
     void paint(const std::vector<SemanticHit> &hits)
     {
         if (!sci) return;
+        configure_indicator();
         sptr_t doc_len = send(sci, SCI_GETLENGTH, 0, 0);
-        send(sci, SCI_SETINDICATORCURRENT, kIndicator, 0);
+        if (indicator < 0) return;
+        send(sci, SCI_SETINDICATORCURRENT, static_cast<uptr_t>(indicator), 0);
         send(sci, SCI_INDICATORCLEARRANGE, 0, doc_len);
         std::set<int> want_lines;
         for (const SemanticHit &hit : hits) {
@@ -268,8 +319,11 @@ struct Controller {
     void clear_heatmap()
     {
         last_hits.clear();
-        if (!sci) return;
-        send(sci, SCI_SETINDICATORCURRENT, kIndicator, 0);
+        if (!sci || indicator < 0) {
+            if (sci) sync_bookmarks({});
+            return;
+        }
+        send(sci, SCI_SETINDICATORCURRENT, static_cast<uptr_t>(indicator), 0);
         send(sci, SCI_INDICATORCLEARRANGE, 0, send(sci, SCI_GETLENGTH, 0, 0));
         sync_bookmarks({});
     }
@@ -318,6 +372,21 @@ struct Controller {
         run_query();
     }
 
+    // Worker thread only. Never score a new backend against the old index.
+    bool rebuild_after_backend_change(uint64_t before, uint64_t gen)
+    {
+        if (!invalidate_changed_backend(*provider, before, *index, cache)) return false;
+        // Invalidate already queued UI results before requesting the rebuild.
+        if (!build_gen.compare_exchange_strong(gen, gen + 1)) return true;
+        post_main([this, expected = gen + 1] {
+            if (build_gen.load() != expected || idle_gate().dead.load()) return;
+            index_ready = false;
+            clear_heatmap();
+            rebuild_now();
+        });
+        return true;
+    }
+
     void run_query()
     {
         uint64_t qgen = query_gen.load();
@@ -327,7 +396,10 @@ struct Controller {
             if (qgen != query_gen.load() || bgen != build_gen.load() || !provider || !index) return;
             std::vector<float> qvec;
             std::string error;
-            if (!provider->embed_batch({q}, qvec, error, {})) {
+            const auto backend = provider->backend_generation();
+            bool embedded = provider->embed_batch({q}, qvec, error, {});
+            if (rebuild_after_backend_change(backend, bgen)) return;
+            if (!embedded) {
                 if (qgen != query_gen.load() || bgen != build_gen.load()) return;
                 post_main([this, qgen, bgen, error] {
                     if (qgen != query_gen.load() || bgen != build_gen.load()) return;
@@ -385,7 +457,9 @@ struct Controller {
         if (shut_down || idle_gate().dead.load()) return;
         if (!open || !sci || !doc) return;
         uint64_t gen = build_gen.fetch_add(1) + 1;
-        downloads.cancel();
+        // Document generations invalidate sentence results, not model assets.
+        // Reuse a download already running for this model/backend selection.
+        const auto download_ticket = downloads.ticket();
         index_ready = false;
         clear_heatmap();
         sptr_t doc_len = send(sci, SCI_GETLENGTH, 0, 0);
@@ -411,13 +485,15 @@ struct Controller {
         std::string want_model = model_id;
         std::string want_ep = ep_id;
         set_status("Indexing...", true);
-        worker.post([this, gen, bytes = std::move(bytes), first, q, qgen, want_model, want_ep] {
+        // This build generation supersedes all pending builds and queries.
+        // Keep only its snapshot while the worker finishes a model download.
+        worker.post_latest([this, gen, bytes = std::move(bytes), first, q, qgen, want_model, want_ep, download_ticket] {
             if (idle_gate().dead.load() || worker.stopping() || gen != build_gen.load()) return;
-            build_job(gen, bytes, first, q, qgen, want_model, want_ep);
+            build_job(gen, bytes, first, q, qgen, want_model, want_ep, download_ticket);
         });
     }
 
-    bool ensure_provider(const std::string &want_model, const std::string &want_ep, std::string &error)
+    bool ensure_provider(const std::string &want_model, const std::string &want_ep, CancellableSpawn::Ticket ticket, std::string &error)
     {
         const ModelSpec *spec = zoo.find(want_model);
         if (!spec) {
@@ -426,17 +502,30 @@ struct Controller {
         }
         bool same = provider && provider->available() && loaded_model == spec->id && loaded_ep == want_ep;
         if (same) return true;
-        std::string dir = storage_dir(spec->id);
-        std::string model_path = dir + "/" + spec->model.filename;
-        bool have_model = g_file_test(model_path.c_str(), G_FILE_TEST_IS_REGULAR);
-        if (!have_model) {
-            std::string name = spec->name;
-            post_main([this, gen = build_gen.load(), name] {
-                if (idle_gate().dead.load() || gen != build_gen.load() || !open) return;
-                set_status("Downloading " + name + "...", true);
-            });
+        if (downloads.cancelled(ticket)) { error = "cancelled"; return false; }
+        if (!npp_ort_runtime_available()) {
+            error = npp_ort_missing_message();
+            return false;
         }
-        if (!zoo.ensure(*spec, dir, error, &downloads)) return false;
+        std::string dir = storage_dir(spec->id);
+        std::string name = spec->name;
+        bool installed = zoo.ensure(*spec, dir, error, &downloads, ticket, [this, ticket, name] {
+            post_main([this, ticket, name] {
+                if (downloads.cancelled(ticket) || !open) return;
+                downloading_ticket = ticket;
+                downloading_status = "Downloading " + name + "...";
+                render_status();
+            });
+        });
+        post_main([this, ticket] {
+            // An older completion must not clear a newer model's status.
+            if (downloading_ticket != ticket) return;
+            downloading_ticket.reset();
+            downloading_status.clear();
+            render_status();
+        });
+        if (!installed) return false;
+        if (downloads.cancelled(ticket)) { error = "cancelled"; return false; }
         OnnxProviderConfig cfg;
         cfg.model_path = dir + "/" + spec->model.filename;
         cfg.vocab_path = dir + "/" + spec->vocab.filename;
@@ -446,7 +535,8 @@ struct Controller {
         cfg.execution_provider = want_ep;
         auto created = make_onnx_provider(cfg, error);
         if (!created) return false;
-        if (loaded_model != spec->id || loaded_ep != want_ep) cache.clear();
+        if (downloads.cancelled(ticket)) { error = "cancelled"; return false; }
+        cache.clear(); // A new session must never inherit a previous backend's vectors.
         provider = std::move(created);
         loaded_model = spec->id;
         loaded_ep = want_ep;
@@ -458,7 +548,8 @@ struct Controller {
 
     void build_job(uint64_t gen, const std::string &bytes, int64_t first,
                    const std::string &q, uint64_t qgen,
-                   const std::string &want_model, const std::string &want_ep)
+                   const std::string &want_model, const std::string &want_ep,
+                   CancellableSpawn::Ticket ticket)
     {
         if (idle_gate().dead.load() || worker.stopping() || gen != build_gen.load()) return;
         auto spans_now = split_sentences(bytes);
@@ -493,8 +584,8 @@ struct Controller {
             return;
         }
         std::string error;
-        if (!ensure_provider(want_model, want_ep, error)) {
-            if (gen != build_gen.load()) return;
+        if (!ensure_provider(want_model, want_ep, ticket, error)) {
+            if (gen != build_gen.load() || error == "cancelled") return;
             post_main([this, gen, error] {
                 if (gen != build_gen.load()) return;
                 set_status(error.empty() ? "Could not load the embedding model" : error, false);
@@ -502,17 +593,32 @@ struct Controller {
             return;
         }
         if (gen != build_gen.load()) return;
+        {
+            std::string backend = provider->backend_name();
+            size_t total = spans_now.size();
+            post_main([this, gen, backend, total] {
+                if (idle_gate().dead.load() || gen != build_gen.load()) return;
+                char buf[256];
+                std::snprintf(buf, sizeof buf, "Indexing 0 of %u... · %s",
+                              static_cast<unsigned>(total), backend.c_str());
+                set_status(buf, true);
+            });
+        }
         int dim = provider->dimension();
         index->reset(static_cast<size_t>(dim));
 
         std::vector<float> qvec;
         bool have_q = false;
+        auto backend_before = provider->backend_generation();
         if (!q.empty() && qgen == query_gen.load()) {
             std::string qerr;
             if (provider->embed_batch({q}, qvec, qerr, {}) &&
                 static_cast<int>(qvec.size()) == dim)
                 have_q = true;
         }
+        /* A query that knocked the session down to CPU must not reuse
+         * sentence vectors cached from the GPU session. */
+        if (provider->backend_generation() != backend_before) cache.clear();
 
         struct Row {
             std::string text;
@@ -520,7 +626,6 @@ struct Controller {
         };
         std::vector<Row> rows(spans_now.size());
         std::vector<std::string> miss_text;
-        std::vector<size_t> miss_row;
         size_t embedded = 0;
         auto add_row = [&](size_t row, const std::vector<float> &vec) {
             if (rows[row].added) return;
@@ -543,10 +648,7 @@ struct Controller {
                     break;
                 }
             }
-            if (!queued) {
-                miss_text.push_back(rows[i].text);
-                miss_row.push_back(i);
-            }
+            if (!queued) miss_text.push_back(rows[i].text);
         }
 
         auto publish = [&](bool done) {
@@ -591,26 +693,40 @@ struct Controller {
                     set_status(index_status, false);
                     if (!query.empty()) run_query();
                 } else {
-                    std::snprintf(buf, sizeof buf, "Indexing %u of %u...",
+                    std::snprintf(buf, sizeof buf, "Indexing %u of %u... · %s",
                                   static_cast<unsigned>(n_embedded),
-                                  static_cast<unsigned>(total));
+                                  static_cast<unsigned>(total),
+                                  backend.c_str());
                     set_status(buf, true);
                 }
             });
         };
 
-        if (!miss_text.empty()) {
+        auto embed_list = [&](const std::vector<std::string> &texts) -> bool {
+            if (texts.empty()) return true;
             std::vector<float> out;
             std::string emb_error;
-            bool ok = provider->embed_batch(miss_text, out, emb_error, [&](const std::vector<size_t> &done_idx) {
+            bool ok = provider->embed_batch(texts, out, emb_error, [&](const std::vector<size_t> &done_idx) {
                 if (gen != build_gen.load() || worker.stopping()) return false;
+                /* An empty list is the GPU-to-CPU restart. Drop every
+                 * vector added so far, including cache hits from this
+                 * session, and let the retry fill the index again. */
+                if (done_idx.empty()) {
+                    cache.clear();
+                    index->reset(static_cast<size_t>(dim));
+                    for (auto &row : rows) row.added = false;
+                    embedded = 0;
+                    have_q = false;
+                    publish(false);
+                    return gen == build_gen.load() && !worker.stopping();
+                }
                 for (size_t di : done_idx) {
-                    if (di >= miss_text.size()) continue;
+                    if (di >= texts.size()) continue;
                     const float *src = out.data() + di * static_cast<size_t>(dim);
                     std::vector<float> vec(src, src + dim);
-                    cache[miss_text[di]] = vec;
+                    cache[texts[di]] = vec;
                     for (size_t row = 0; row < rows.size(); ++row) {
-                        if (!rows[row].added && rows[row].text == miss_text[di])
+                        if (!rows[row].added && rows[row].text == texts[di])
                             add_row(row, vec);
                     }
                 }
@@ -618,15 +734,45 @@ struct Controller {
                 return gen == build_gen.load() && !worker.stopping();
             });
             if (!ok) {
-                if (gen != build_gen.load() || emb_error == "cancelled") return;
+                if (gen != build_gen.load() || emb_error == "cancelled") return false;
                 post_main([this, gen, emb_error] {
                     if (gen != build_gen.load()) return;
                     set_status(emb_error.empty() ? "Could not embed sentences" : emb_error, false);
                 });
-                return;
+                return false;
             }
-            if (cache.size() > kCacheLimit) cache.clear();
+            return true;
+        };
+
+        if (!embed_list(miss_text)) return;
+        /* Cache hits added before a fallback are the wrong backend.
+         * The reset above marked them not added. Embed those texts now,
+         * on whatever provider is actually running. */
+        std::vector<std::string> left;
+        for (const Row &row : rows) {
+            if (row.added) continue;
+            bool queued = false;
+            for (const std::string &have : left) {
+                if (have == row.text) {
+                    queued = true;
+                    break;
+                }
+            }
+            if (!queued) left.push_back(row.text);
         }
+        if (!embed_list(left)) return;
+        if (!have_q && !q.empty() && qgen == query_gen.load()) {
+            std::string qerr;
+            std::vector<float> again;
+            const auto backend = provider->backend_generation();
+            bool embedded_query = provider->embed_batch({q}, again, qerr, {});
+            if (rebuild_after_backend_change(backend, gen)) return;
+            if (embedded_query && static_cast<int>(again.size()) == dim) {
+                qvec = std::move(again);
+                have_q = true;
+            }
+        }
+        if (cache.size() > kCacheLimit) cache.clear();
         if (gen != build_gen.load()) return;
         publish(true);
     }
@@ -636,23 +782,34 @@ struct Controller {
         if (shut_down || idle_gate().dead.load()) return;
         NppDoc *next_doc = next ? static_cast<NppDoc *>(g_object_get_data(G_OBJECT(next), "npp-doc"))
                                 : nullptr;
-        if (next == sci && next_doc == doc) {
+        std::uintptr_t next_view = reinterpret_cast<std::uintptr_t>(next);
+        std::uintptr_t next_doc_ptr = doc_pointer(next);
+        DocAttach kind = track.classify_attach(next_view, next_doc_ptr);
+        if (kind == DocAttach::SameView) {
+            if (open && !index_ready) rebuild_now();
+            return;
+        }
+        if (kind == DocAttach::SameDocument) {
+            track.retarget(next_view);
+            sci = next;
+            doc = next_doc;
+            configure_indicator();
             if (open && !index_ready) rebuild_now();
             return;
         }
         build_gen.fetch_add(1);
         query_gen.fetch_add(1);
-        downloads.cancel();
         if (rebuild_timer) {
             g_source_remove(rebuild_timer);
             rebuild_timer = 0;
         }
         clear_heatmap();
+        track.switch_to(next_view, next_doc_ptr);
         sci = next;
         doc = next_doc;
         index_ready = false;
         spans.clear();
-        if (!sci || !doc) return;
+        if (!sci || !doc || next_doc_ptr == 0) return;
         configure_indicator();
         rebuild_now();
     }
@@ -669,6 +826,7 @@ struct Controller {
         query_gen.fetch_add(1);
         downloads.cancel();
         clear_heatmap();
+        track.switch_to(0, 0);
         index_ready = false;
         sci = nullptr;
         doc = nullptr;
@@ -698,9 +856,12 @@ struct Controller {
         build_gen.fetch_add(1);
         query_gen.fetch_add(1);
         downloads.retire();
+        /* The session is released on the worker, after the in-flight job
+         * returns and before that thread exits. join then returns. */
+        worker.set_on_stop([this] { provider.reset(); });
         worker.shutdown();
-        /* Release sessions before process-exit handlers tear down the
-         * dynamically loaded GPU runtime. The worker must finish first. */
+        /* The index holds a reference to the engine. */
+        index.reset();
         engine.reset();
         provider.reset();
     }
@@ -753,6 +914,7 @@ void on_model(GObject *, GParamSpec *, gpointer)
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctrl().model_dd));
     if (sel >= ctrl().model_ids.size()) return;
     if (ctrl().model_ids[sel] == ctrl().model_id) return;
+    ctrl().downloads.cancel();
     ctrl().model_id = ctrl().model_ids[sel];
     ctrl().refresh_legend();
     ctrl().save_prefs();
@@ -765,6 +927,7 @@ void on_ep(GObject *, GParamSpec *, gpointer)
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctrl().ep_dd));
     if (sel >= ctrl().ep_ids.size()) return;
     if (ctrl().ep_ids[sel] == ctrl().ep_id) return;
+    ctrl().downloads.cancel();
     ctrl().ep_id = ctrl().ep_ids[sel];
     ctrl().save_prefs();
     if (ctrl().open) ctrl().rebuild_now();
@@ -787,6 +950,8 @@ void on_close_clicked(GtkButton *, gpointer)
 }
 
 } /* namespace */
+
+extern "C" int npp_alloc_one_indicator(void);
 
 GtkWidget *semantic_search_bar_new(void)
 {
@@ -929,6 +1094,9 @@ GtkWidget *semantic_search_bar_new(void)
     g_signal_connect(c.model_dd, "notify::selected", G_CALLBACK(on_model), nullptr);
     g_signal_connect(c.ep_dd, "notify::selected", G_CALLBACK(on_ep), nullptr);
     c.ui_ready = true;
+    c.indicator = npp_alloc_one_indicator();
+    if (c.indicator < 0 && c.index_status.empty())
+        c.index_status = "Semantic search could not allocate an indicator";
     if (!c.index_status.empty()) c.set_status(c.index_status, false);
     return c.revealer;
 }
@@ -953,10 +1121,12 @@ void semantic_search_note_modified(GtkWidget *sci)
 {
     if (idle_gate().dead.load()) return;
     Controller &c = ctrl();
-    if (!c.open || !sci || sci != c.sci) return;
+    if (!c.open || !sci) return;
+    std::uintptr_t ptr = c.doc_pointer(sci);
+    if (!c.track.accepts_modification(ptr)) return;
+    c.configure_indicator();
     c.index_ready = false;
     c.build_gen.fetch_add(1);
-    c.downloads.cancel();
     c.clear_heatmap();
     c.set_status("Indexing...", true);
     c.schedule_rebuild();
@@ -970,26 +1140,66 @@ void semantic_search_note_activated(GtkWidget *sci)
     c.attach(sci);
 }
 
-void semantic_search_note_closed(NppDoc *doc)
+void semantic_search_note_closed(NppDoc *closing)
 {
-    if (!doc || idle_gate().dead.load()) return;
+    if (!closing || !closing->sci || idle_gate().dead.load()) return;
     Controller &c = ctrl();
-    if (c.doc == doc) {
-        c.build_gen.fetch_add(1);
-        c.query_gen.fetch_add(1);
-        c.downloads.cancel();
-        /* Clear while sci is still alive, so bookmarks this feature
-         * added are removed before the map entry goes away. */
-        c.clear_heatmap();
-        c.sci = nullptr;
-        c.doc = nullptr;
-        c.index_ready = false;
-        c.spans.clear();
+    std::uintptr_t closed_view = reinterpret_cast<std::uintptr_t>(closing->sci);
+    std::uintptr_t closed_doc = c.doc_pointer(closing->sci);
+    std::vector<DocView> open;
+    std::vector<NppDoc *> open_docs;
+    GPtrArray *docs = editor_all_docs();
+    if (docs) {
+        for (guint i = 0; i < docs->len; ++i) {
+            auto *d = static_cast<NppDoc *>(g_ptr_array_index(docs, i));
+            if (!d || !d->sci) continue;
+            DocView view;
+            view.view = reinterpret_cast<std::uintptr_t>(d->sci);
+            view.doc = c.doc_pointer(d->sci);
+            open.push_back(view);
+            open_docs.push_back(d);
+        }
+        g_ptr_array_free(docs, TRUE);
     }
-    c.our_bookmarks.erase(doc);
+    DocCloseResult result = c.track.classify_close(closed_view, closed_doc, open);
+    if (result.action == DocClose::Unrelated || result.action == DocClose::Keep)
+        return;
+    if (result.action == DocClose::Retarget) {
+        c.track.apply_close(result);
+        for (NppDoc *d : open_docs) {
+            if (!d || !d->sci) continue;
+            if (reinterpret_cast<std::uintptr_t>(d->sci) != result.view) continue;
+            c.sci = d->sci;
+            c.doc = d;
+            c.configure_indicator();
+            break;
+        }
+        return;
+    }
+    /* Last view of this document. Delete bookmarks while its widget
+     * is still alive, and do it only on this close. */
+    c.build_gen.fetch_add(1);
+    c.query_gen.fetch_add(1);
+    // A model belongs to the search feature, not the tab being closed.
+    bool another_tab = std::any_of(open_docs.begin(), open_docs.end(),
+                                  [closing](NppDoc *d) { return d != closing; });
+    if (!another_tab) c.downloads.cancel();
+    if (!c.sci) c.sci = closing->sci;
+    c.clear_heatmap();
+    c.track.apply_close(result);
+    c.sci = nullptr;
+    c.doc = nullptr;
+    c.index_ready = false;
+    c.spans.clear();
 }
 
 void semantic_search_shutdown(void)
 {
     ctrl().shutdown();
+}
+
+void semantic_search_configure_view(GtkWidget *sci)
+{
+    if (idle_gate().dead.load()) return;
+    ctrl().configure_indicator_on(sci);
 }

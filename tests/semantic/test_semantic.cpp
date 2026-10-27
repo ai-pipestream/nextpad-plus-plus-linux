@@ -4,6 +4,10 @@
  * in and the model files named below are present. Pass --bench to print
  * int8 throughput.
  */
+#include "CancellableSpawn.h"
+#include "BackendConsistency.h"
+#include "DocumentTrack.h"
+#include "EmbedFallback.h"
 #include "ExecutionProviders.h"
 #include "OrtRuntime.h"
 #include "ModelZoo.h"
@@ -11,8 +15,10 @@
 #include "SemanticInterfaces.h"
 #include "SentenceSplitter.h"
 #include "WordPieceTokenizer.h"
+#include "indicator_alloc.h"
 
 #include <glib.h>
+#include <glib/gstdio.h>
 
 #include <chrono>
 #include <cmath>
@@ -20,6 +26,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -573,6 +581,392 @@ int bench()
 
 #endif /* NPP_HAVE_ONNXRUNTIME */
 
+std::string hex64(char fill)
+{
+    return std::string(64, fill);
+}
+
+std::string manifest_model(const std::string &id, const std::string &arch_key)
+{
+    return "    {\n"
+           "      \"id\": \"" + id + "\",\n"
+           "      \"name\": \"" + id + "\",\n"
+           "      \"dimension\": 4,\n"
+           "      \"pooling\": \"mean\",\n"
+           "      \"max_tokens\": 8,\n"
+           "      \"vocab\": {\"filename\": \"vocab.txt\", \"url\": \"file:///missing-vocab\",\n"
+           "        \"sha256\": \"" + hex64('a') + "\"},\n"
+           "      \"model\": {\"" + arch_key + "\": {\"filename\": \"m.onnx\", \"url\": \"file:///missing-model\",\n"
+           "        \"sha256\": \"" + hex64('b') + "\"}}\n"
+           "    }";
+}
+
+bool write_manifest(const std::string &path, const std::string &json)
+{
+    std::ofstream out(path);
+    if (!out) return false;
+    out << json;
+    return out.good();
+}
+
+void test_manifest_arch_filter()
+{
+    std::string arch = ModelZoo::host_arch();
+    std::string other = arch == "aarch64" ? "x86_64" : "aarch64";
+    gchar *dir = g_dir_make_tmp("npp-sem-manifest-XXXXXX", nullptr);
+    expect(dir != nullptr, "manifest tmp");
+    if (!dir) return;
+    std::string path = std::string(dir) + "/models.json";
+
+    std::string keep = "{\n  \"default\": \"keep\",\n  \"models\": [\n" +
+                       manifest_model("skip-me", other) + ",\n" +
+                       manifest_model("keep", "all") + "\n  ]\n}\n";
+    expect(write_manifest(path, keep), "write keep manifest");
+    ModelZoo zoo;
+    std::string error;
+    expect(zoo.load_file(path, error), error.empty() ? "skip other arch" : error);
+    expect(zoo.models().size() == 1, "one model remains");
+    expect(zoo.find("skip-me") == nullptr, "other arch was skipped");
+    expect(zoo.find("keep") != nullptr, "all-arch model kept");
+    expect(zoo.default_id() == "keep", "default kept");
+
+    std::string skipped_default = "{\n  \"default\": \"needs-file\",\n  \"models\": [\n" +
+                                  manifest_model("needs-file", other) + ",\n" +
+                                  manifest_model("keep", "all") + "\n  ]\n}\n";
+    expect(write_manifest(path, skipped_default), "write default-skip manifest");
+    ModelZoo missing_default;
+    expect(!missing_default.load_file(path, error), "default without a file must fail");
+    expect(error.find("needs-file") != std::string::npos, error);
+    expect(error.find("no file") != std::string::npos, error);
+
+    std::string none = "{\n  \"default\": \"absent\",\n  \"models\": [\n" +
+                       manifest_model("one", other) + ",\n" +
+                       manifest_model("two", other) + "\n  ]\n}\n";
+    expect(write_manifest(path, none), "write empty-arch manifest");
+    ModelZoo empty;
+    expect(!empty.load_file(path, error), "no runnable model must fail");
+    expect(error == "manifest lists no models", error);
+    g_free(dir);
+}
+
+void test_model_files_reused()
+{
+    gchar *dir = g_dir_make_tmp("npp-sem-reuse-XXXXXX", nullptr);
+    expect(dir != nullptr, "model reuse temporary directory");
+    if (!dir) return;
+    std::string root = dir, source = root + "/source";
+    std::string error, hash;
+    expect(g_file_set_contents(source.c_str(), "cached model fixture", -1, nullptr), "write model fixture");
+    expect(ModelZoo::file_sha256(source, hash, error), error);
+    ModelSpec spec;
+    spec.id = "reuse-test";
+    spec.vocab = {"vocab.txt", "file://" + source, hash};
+    spec.model = {"model.onnx", "file://" + source, hash};
+    CancellableSpawn spawn;
+    int children = 0;
+    int download_notifications = 0;
+    spawn.set_pre_lock_hook([&] { ++children; });
+    ModelZoo zoo;
+    expect(zoo.ensure(spec, root + "/cache", error, &spawn, std::nullopt,
+                      [&] { ++download_notifications; }), error);
+    expect(children == 2, "first installation downloads vocabulary and model once");
+    expect(download_notifications == 2, "both real transfers report downloading");
+    std::remove(source.c_str()); // the source is no longer available
+    expect(zoo.ensure(spec, root + "/cache", error, &spawn, std::nullopt,
+                      [&] { ++download_notifications; }), error);
+    expect(children == 2, "verified model files are reused without any network request");
+    expect(download_notifications == 2, "cached files do not report a download");
+    std::remove((root + "/cache/vocab.txt").c_str());
+    std::remove((root + "/cache/model.onnx").c_str());
+    g_rmdir((root + "/cache").c_str());
+    g_rmdir(root.c_str());
+    g_free(dir);
+}
+
+void test_download_failure_message()
+{
+    std::string network = ModelZoo::download_failure_message("offline-demo", false, 6);
+    std::string curl = ModelZoo::download_failure_message("offline-demo", true);
+    expect(network.find("offline-demo") != std::string::npos, network);
+    expect(network.find("not installed") != std::string::npos, network);
+    expect(network.find("network") != std::string::npos, network);
+    expect(network.find("curl") == std::string::npos, network);
+    expect(curl.find("curl") != std::string::npos, curl);
+    expect(ModelZoo::download_failure_message("m", false, 22).find("HTTP") != std::string::npos, "HTTP failure");
+    expect(ModelZoo::download_failure_message("m", false, 23).find("disk") != std::string::npos, "disk failure");
+    expect(ModelZoo::download_failure_message("m", false, 60).find("TLS") != std::string::npos, "TLS failure");
+
+    ModelSpec spec;
+    spec.id = "offline-demo";
+    spec.vocab.filename = "vocab.txt";
+    spec.vocab.url = "file:///no/such/npp-semantic-vocab";
+    spec.vocab.sha256 = hex64('a');
+    spec.model.filename = "m.onnx";
+    spec.model.url = "file:///no/such/npp-semantic-model";
+    spec.model.sha256 = hex64('b');
+    gchar *dir = g_dir_make_tmp("npp-sem-dl-XXXXXX", nullptr);
+    expect(dir != nullptr, "download tmp");
+    if (!dir) return;
+    ModelZoo zoo;
+    std::string error;
+    std::string diagnostic;
+    guint log_handler = g_log_set_handler(nullptr, G_LOG_LEVEL_MESSAGE,
+        [](const gchar *, GLogLevelFlags, const gchar *message, gpointer data) {
+            *static_cast<std::string *>(data) = message;
+        }, &diagnostic);
+    bool installed = zoo.ensure(spec, dir, error);
+    g_log_remove_handler(nullptr, log_handler);
+    expect(!installed, "missing file should fail");
+    expect(diagnostic.find("curl exit 37") != std::string::npos &&
+           diagnostic.find("curl:") != std::string::npos,
+           "curl failure code and stderr must be logged");
+    expect(error.find("offline-demo") != std::string::npos, error);
+    expect(error.find("not installed") != std::string::npos, error);
+    expect(error.find("source file") != std::string::npos, error);
+    expect(error.find("curl:") == std::string::npos, error);
+    expect(error != "cancelled", error);
+
+    CancellableSpawn spawn;
+    auto ticket = spawn.ticket();
+    spawn.cancel();
+    std::string stale;
+    expect(!zoo.ensure(spec, dir, stale, &spawn, ticket) && stale == "cancelled",
+           "queued ensure cannot acquire a new ticket after cancel");
+    spawn.retire();
+    std::string cancelled;
+    expect(!zoo.ensure(spec, dir, cancelled, &spawn), "retired download should fail");
+    expect(cancelled == "cancelled", cancelled);
+    g_free(dir);
+}
+
+void test_backend_label()
+{
+    expect(onnx_backend_label(false, "auto", nullptr) == "ONNX Runtime CPU", "automatic cpu");
+    expect(onnx_backend_label(false, "cpu", nullptr) == "ONNX Runtime CPU", "explicit cpu");
+    expect(onnx_backend_label(false, "", nullptr) == "ONNX Runtime CPU", "empty request");
+    expect(onnx_backend_label(false, "cuda", nullptr) == "ONNX Runtime CPU (GPU unavailable)",
+           "explicit cuda");
+    expect(onnx_backend_label(false, "OpenVINO", nullptr) == "ONNX Runtime CPU (GPU unavailable)",
+           "explicit openvino");
+    expect(onnx_backend_label(true, "auto", "cuda") == "ONNX Runtime cuda GPU", "cuda ran");
+    expect(std::string(onnx_cpu_fallback_label()) == "ONNX Runtime CPU (GPU inference failed)",
+           "fallback label");
+}
+
+void test_embed_fallback_restarts()
+{
+    int calls = 0;
+    int resets = 0;
+    int fallbacks = 0;
+    bool gpu = true;
+    std::vector<size_t> seen;
+    std::string error;
+    bool ok = run_embed_batches(
+        3, 2, gpu,
+        [&](size_t base, size_t n, std::vector<size_t> &indexes, std::string &err) {
+            ++calls;
+            if (gpu && base > 0) {
+                err = "gpu batch failed";
+                return false;
+            }
+            indexes.clear();
+            for (size_t k = 0; k < n; ++k) indexes.push_back(base + k);
+            return true;
+        },
+        [&](std::string &err) {
+            ++fallbacks;
+            err.clear();
+            return true;
+        },
+        [&](const std::vector<size_t> &indexes) {
+            if (indexes.empty()) {
+                ++resets;
+                seen.clear();
+                return true;
+            }
+            seen.insert(seen.end(), indexes.begin(), indexes.end());
+            return true;
+        },
+        error);
+    expect(ok, error.empty() ? "restart ok" : error);
+    expect(!gpu, "still marked GPU");
+    expect(fallbacks == 1, "fallback once");
+    expect(resets == 1, "one discard");
+    expect(calls == 4, "every batch ran again");
+    expect(seen.size() == 3 && seen[0] == 0 && seen[1] == 1 && seen[2] == 2, "cpu rows only");
+
+    int fallback_calls = 0;
+    bool stay = false;
+    std::string hard;
+    bool failed = run_embed_batches(
+        1, 1, stay,
+        [&](size_t, size_t, std::vector<size_t> &, std::string &err) {
+            err = "cpu failed";
+            return false;
+        },
+        [&](std::string &) {
+            ++fallback_calls;
+            return true;
+        },
+        {},
+        hard);
+    expect(!failed && hard == "cpu failed", hard);
+    expect(fallback_calls == 0, "cpu failure must not fall back");
+
+    bool again = true;
+    int second = 0;
+    std::string give_up;
+    bool gave = run_embed_batches(
+        1, 1, again,
+        [&](size_t, size_t, std::vector<size_t> &, std::string &err) {
+            err = "still bad";
+            return false;
+        },
+        [&](std::string &err) {
+            ++second;
+            err.clear();
+            return second == 1;
+        },
+        {},
+        give_up);
+    expect(!gave, "second failure must stop");
+    expect(second == 1, "fallback only on the first failure");
+    expect(!again, "gpu flag cleared");
+}
+
+void test_document_track_and_handles()
+{
+    DocumentTrack track;
+    const std::uintptr_t doc = 100;
+    const std::uintptr_t view_a = 1;
+    const std::uintptr_t view_b = 2;
+    expect(track.classify_attach(view_a, doc) == DocAttach::SwitchDocument, "first attach");
+    track.switch_to(view_a, doc);
+    expect(track.classify_attach(view_a, doc) == DocAttach::SameView, "same view");
+    expect(track.classify_attach(view_b, doc) == DocAttach::SameDocument, "clone");
+    track.retarget(view_b);
+    expect(track.view() == view_b && track.doc() == doc, "retarget keeps the document");
+    track.retarget(view_a);
+    expect(track.accepts_modification(doc), "clone edit");
+    expect(!track.accepts_modification(999), "other document");
+
+    std::vector<DocView> both = {{view_a, doc}, {view_b, doc}};
+    DocCloseResult keep = track.classify_close(view_b, doc, both);
+    expect(keep.action == DocClose::Keep, "closing the other clone");
+    track.apply_close(keep);
+    expect(track.view() == view_a && track.doc() == doc, "tracked view stays");
+
+    DocCloseResult retarget = track.classify_close(view_a, doc, both);
+    expect(retarget.action == DocClose::Retarget && retarget.view == view_b, "retarget on close");
+    track.handles().push_back(7);
+    track.apply_close(retarget);
+    expect(track.view() == view_b && track.handles().size() == 1, "handles survive retarget");
+
+    std::vector<DocView> only_b = {{view_b, doc}};
+    DocCloseResult last = track.classify_close(view_b, doc, only_b);
+    expect(last.action == DocClose::ClearLast, "last view");
+    track.apply_close(last);
+    expect(!track.active() && track.handles().empty(), "cleared once");
+
+    std::map<int, int> line_of;
+    std::map<int, unsigned> mask;
+    int next_handle = 1;
+    MarkerFns fns;
+    fns.line_from_handle = [&](int handle) {
+        auto it = line_of.find(handle);
+        return it == line_of.end() ? -1 : it->second;
+    };
+    fns.delete_handle = [&](int handle) { line_of.erase(handle); };
+    fns.mask_on_line = [&](int line) {
+        auto it = mask.find(line);
+        return it == mask.end() ? 0u : it->second;
+    };
+    fns.add_on_line = [&](int line) {
+        int handle = next_handle++;
+        line_of[handle] = line;
+        mask[line] |= 1u;
+        return handle;
+    };
+    std::vector<int> handles;
+    const unsigned bit = 1u;
+    sync_marker_handles(handles, {5}, bit, fns);
+    expect(handles.size() == 1 && line_of[handles[0]] == 5, "added by handle");
+    int kept = handles[0];
+    line_of[kept] = 6;
+    sync_marker_handles(handles, {6}, bit, fns);
+    expect(handles.size() == 1 && handles[0] == kept, "moved line kept its handle");
+    expect(line_of.count(kept) == 1, "handle was not deleted");
+    mask[3] = bit;
+    sync_marker_handles(handles, {3, 6}, bit, fns);
+    expect(handles.size() == 1 && handles[0] == kept, "pre-existing bookmark left alone");
+    // Scintilla moves a deleted line's marker to its neighbour.
+    line_of[kept] = 4;
+    sync_marker_handles(handles, {3}, bit, fns);
+    expect(line_of.count(kept) == 0, "moved marker removed by handle");
+    expect(mask[3] == bit, "user bookmark remains");
+
+    MarkerSyncState state;
+    mask.clear(); line_of.clear(); handles.clear(); next_handle = 0;
+    sync_marker_handles(handles, {7}, bit, fns, &state);
+    expect(handles.size() == 1 && handles[0] == 0, "zero is a valid marker handle");
+    line_of.clear(); mask.clear(); // user removes the feature bookmark
+    sync_marker_handles(handles, {7, 8}, bit, fns, &state);
+    expect(handles.size() == 1 && line_of[handles[0]] == 8, "next batch respects removed bookmark");
+    sync_marker_handles(handles, {7, 8}, bit, fns, &state);
+    expect(handles.size() == 1, "later batches still respect removal");
+    sync_marker_handles(handles, {}, bit, fns, &state);
+    mask.clear();
+    sync_marker_handles(handles, {7}, bit, fns, &state);
+    expect(handles.size() == 1, "new selection may add a bookmark again");
+}
+
+void test_indicator_alloc()
+{
+    int next = 9, out = -1;
+    expect(npp_indicator_alloc(&next, 9, &out) && out == 10 && next == 19, "contiguous plugin range");
+    expect(npp_indicator_alloc(&next, 1, &out) && out == 20 && next == 21, "last plugin slot");
+    expect(!npp_indicator_alloc(&next, 1, &out) && out == 0 && next == 21, "never allocate editor slots");
+    next = 18; out = 99;
+    expect(!npp_indicator_alloc(&next, 2, &out) && out == 0 && next == 18, "do not span reserved 19");
+    expect(!npp_indicator_alloc(nullptr, 1, &out) && out == 0, "null cursor clears output");
+    expect(!npp_indicator_alloc(&next, 0, &out) && out == 0, "zero request clears output");
+}
+
+void test_query_backend_change()
+{
+    class QueryFallback : public EmbeddingProvider {
+    public:
+        uint64_t generation = 0;
+        bool fail_cpu = false;
+        int dimension() const override { return 2; }
+        int max_tokens() const override { return 8; }
+        bool available() const override { return true; }
+        std::string backend_name() const override { return "test"; }
+        uint64_t backend_generation() const override { return generation; }
+        size_t token_count(const std::string &) const override { return 1; }
+        bool embed_batch(const std::vector<std::string> &, std::vector<float> &out,
+                         std::string &, const SemanticBatchProgress &) override {
+            ++generation;
+            out = {0, 1};
+            return !fail_cpu;
+        }
+    } provider;
+    auto engine = make_cpu_similarity_engine();
+    auto index = make_memory_vector_index(*engine);
+    for (bool fail : {false, true}) {
+        provider.fail_cpu = fail;
+        index->reset(2);
+        std::unordered_map<std::string, std::vector<float>> cache{{"sentence", {1, 0}}};
+        index->add(cache["sentence"].data(), 1);
+        auto before = provider.backend_generation();
+        expect(!invalidate_changed_backend(provider, before, *index, cache), "stable backend keeps vectors");
+        std::vector<float> query; std::string error;
+        provider.embed_batch({"query"}, query, error, {});
+        expect(invalidate_changed_backend(provider, before, *index, cache), "query fallback requires rebuild even if CPU fails");
+        expect(cache.empty() && index->count() == 0, "GPU cache and index both discarded before CPU query scoring");
+    }
+}
+
 } /* namespace */
 
 int main(int argc, char **argv)
@@ -587,6 +981,14 @@ int main(int argc, char **argv)
     test_sentences();
     test_index();
     test_manifest();
+    test_manifest_arch_filter();
+    test_download_failure_message();
+    test_model_files_reused();
+    test_backend_label();
+    test_embed_fallback_restarts();
+    test_document_track_and_handles();
+    test_indicator_alloc();
+    test_query_backend_change();
     test_providers();
 #if NPP_HAVE_ONNXRUNTIME
     if (do_bench) return bench();

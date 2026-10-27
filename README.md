@@ -248,10 +248,58 @@ CUDA/cuDNN. Runtime versions alone do not prove GPU compatibility.
 
 Semantic search defaults to **Automatic** execution and fp32 MiniLM. Automatic
 tries CUDA, then OpenVINO GPU, then CPU, within the loaded runtime's available
-providers. It verifies real inference; failed, non-finite, or invalid GPU output
-retries on CPU. OpenVINO uses GPU/FP32 and CUDA disables TF32 for score parity.
+providers. It verifies real inference. A GPU failure part way through a document
+discards the vectors already produced and embeds the whole document again on
+CPU, so GPU and CPU vectors are not mixed. OpenVINO uses GPU/FP32 and CUDA
+disables TF32 for score parity.
 Existing saved choices are preserved; select Automatic for an existing profile.
-The status line names the active backend.
+
+The status line names the backend that is actually running, including while
+batches are still in progress. It reads `Indexing N of M... · <backend>` and,
+when the index is ready, `N of M sentences indexed · <model> · <backend>`, for
+example `29 of 29 sentences indexed · MiniLM-L6 fp32 · ONNX Runtime CPU`.
+Automatic on a CPU-only runtime shows `ONNX Runtime CPU`. The suffix
+`(GPU unavailable)` is added only when CUDA or OpenVINO was selected and that
+provider could not be used. A backend generation change invalidates both the
+sentence cache and index, including fallback while embedding a new query.
+Scoring resumes after rebuilding sentence vectors on CPU. After a GPU failure the backend
+reads `ONNX Runtime CPU (GPU inference failed)`.
+
+The runtime is checked before any model download. Download errors name the
+model and distinguish connection, HTTP, TLS, timeout, and disk-write failures.
+If curl cannot start, the status asks you to check its installation. Cancellation
+covers both vocabulary and model downloads. Typing and switching documents do
+not cancel a download for the current model/backend. Only the newest pending
+document snapshot is retained while that download runs. Changing model/backend,
+closing search, closing the last open editor tab, or quitting cancels it.
+Closing one tab while others remain keeps the transfer running. The status
+continues to say "Downloading…" through edits and tab changes until the transfer
+finishes. Transfers have a 30-second connection timeout and stop after 60 seconds
+below one byte per second, rather than a total duration cap; slow connections
+can finish the model download.
+Verified model files remain on disk across launches. The loaded provider and
+unchanged-sentence embeddings are reused across edits and search-bar reopen;
+a model/backend change replaces the provider. Memory is released at shutdown.
+Curl failure diagnostics are written to the application log/stderr while the
+status bar retains the concise error.
+
+Cloned views share one Scintilla document. An edit in either view refreshes
+the semantic index, and the heatmap is drawn on that shared document. Closing
+one of two clones leaves the heatmap and the bookmarks semantic search added.
+Closing the last view of the document removes only those bookmarks. Bookmarks
+are tracked by marker handle, so an edit that moves lines does not make a
+later removal targets the owned marker. Scintilla may move a deleted line's
+marker to a neighbouring line; ownership follows the handle. Manually removed
+feature bookmarks stay removed during subsequent indexing batches, until the
+search selection is cleared or rebuilt.
+
+The heatmap obtains its indicator through `npp_alloc_one_indicator`, which
+shares the host allocator used by plugin calls to `NPPM_ALLOCATEINDICATOR`. The allocator starts at indicator 9 and skips
+indicator 9 (incremental search) and indicator 19 (clickable links), so the
+first slot it hands out is 10. Allocation is capped at 20; higher slots belong
+to the editor (including Mark All at 31). Failed requests return output 0. The search
+bar is created before plugins load and takes that first slot. A plugin request
+that fits in the gaps around indicators 9 and 19 still succeeds.
 
 Colour calibration belongs to the **model**, not the CPU/GPU. Every manifest
 entry declares `heatmap_profile`; the current MiniLM exports use `minilm` on all

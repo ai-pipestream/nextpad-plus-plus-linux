@@ -29,10 +29,10 @@ void drain_fd(int fd, std::string &out)
 
 } /* namespace */
 
-CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &args)
+CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &args, Ticket ticket)
 {
     Result result;
-    if (retired_.load()) {
+    if (cancelled(ticket)) {
         result.cancelled = true;
         return result;
     }
@@ -47,13 +47,19 @@ CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &a
     for (std::string &arg : storage) argv.push_back(arg.data());
     argv.push_back(nullptr);
 
+    std::function<void()> hook;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (retired_.load()) {
+        hook = pre_lock_hook_;
+    }
+    if (hook) hook();
+
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (retired_.load() || cancel_gen_.load() != ticket) {
             result.cancelled = true;
             return result;
         }
-        abort_.store(false);
         pid_ = 0;
     }
 
@@ -80,13 +86,13 @@ CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &a
     {
         std::lock_guard<std::mutex> lock(mu_);
         pid_ = static_cast<int>(pid);
-        if (abort_.load() || retired_.load()) kill(pid_, SIGKILL);
+        if (cancel_gen_.load() != ticket || retired_.load()) kill(pid_, SIGKILL);
     }
 
     int status = 0;
     for (;;) {
         drain_fd(stderr_fd, result.stderr_text);
-        bool stop = abort_.load() || retired_.load();
+        bool stop = cancel_gen_.load() != ticket || retired_.load();
         if (stop) {
             std::lock_guard<std::mutex> lock(mu_);
             if (pid_ > 0) kill(pid_, SIGKILL);
@@ -104,7 +110,7 @@ CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &a
         std::lock_guard<std::mutex> lock(mu_);
         pid_ = 0;
     }
-    result.cancelled = abort_.load() || retired_.load();
+    result.cancelled = cancel_gen_.load() != ticket || retired_.load();
     if (WIFEXITED(status)) {
         result.exited = true;
         result.exit_code = WEXITSTATUS(status);
@@ -115,8 +121,14 @@ CancellableSpawn::Result CancellableSpawn::run(const std::vector<std::string> &a
 void CancellableSpawn::cancel()
 {
     std::lock_guard<std::mutex> lock(mu_);
-    abort_.store(true);
+    cancel_gen_.fetch_add(1);
     if (pid_ > 0) kill(pid_, SIGKILL);
+}
+
+void CancellableSpawn::set_pre_lock_hook(std::function<void()> hook)
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    pre_lock_hook_ = std::move(hook);
 }
 
 void CancellableSpawn::retire()

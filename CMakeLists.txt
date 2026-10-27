@@ -142,6 +142,8 @@ add_library(npp_semantic STATIC
     "${SRC}/semantic/ModelZoo.cpp"
     "${SRC}/semantic/BackgroundWorker.cpp"
     "${SRC}/semantic/CancellableSpawn.cpp"
+    "${SRC}/semantic/DocumentTrack.cpp"
+    "${SRC}/semantic/EmbedFallback.cpp"
     "${SRC}/semantic/OrtRuntime.cpp"
 )
 target_include_directories(npp_semantic PUBLIC
@@ -167,6 +169,7 @@ set(APP_SRCS
     "${SRC}/lexilla_bridge.cpp"
     "${SRC}/fuzzy_bridge.cpp"
     "${SRC}/semantic_search.cpp"
+    "${SRC}/indicator_alloc.c"
     "${CMAKE_SOURCE_DIR}/fuzzy/FuzzyMatcher.cxx"
     "${CMAKE_SOURCE_DIR}/fuzzy/FuzzyText.cxx"
     "${SRC}/recent.c"
@@ -397,7 +400,10 @@ install(DIRECTORY resources/icons/hicolor/
         FILES_MATCHING PATTERN "nextpad-plus-plus.*")
 
 enable_testing()
-add_executable(npp_semantic_tests "${CMAKE_SOURCE_DIR}/tests/semantic/test_semantic.cpp")
+add_executable(npp_semantic_tests
+    "${CMAKE_SOURCE_DIR}/tests/semantic/test_semantic.cpp"
+    "${SRC}/indicator_alloc.c")
+target_include_directories(npp_semantic_tests PRIVATE "${SRC}")
 target_link_libraries(npp_semantic_tests PRIVATE npp_semantic)
 target_compile_definitions(npp_semantic_tests PRIVATE
     SEMANTIC_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/semantic"

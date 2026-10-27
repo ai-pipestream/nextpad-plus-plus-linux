@@ -268,7 +268,15 @@ reads `ONNX Runtime CPU (GPU inference failed)`.
 The runtime is checked before any model download. Download errors name the
 model and distinguish connection, HTTP, TLS, timeout, and disk-write failures.
 If curl cannot start, the status asks you to check its installation. Cancellation
-covers the entire queued job, including both vocabulary and model downloads.
+covers both vocabulary and model downloads. Typing and switching documents do
+not cancel a download for the current model/backend. Only the newest pending
+document snapshot is retained while that download runs. Changing model/backend,
+closing search, closing the last tracked document view, or quitting cancels it.
+Verified model files remain on disk across launches. The loaded provider and
+unchanged-sentence embeddings are reused across edits and search-bar reopen;
+a model/backend change replaces the provider. Memory is released at shutdown.
+Curl failure diagnostics are written to the application log/stderr while the
+status bar retains the concise error.
 
 Cloned views share one Scintilla document. An edit in either view refreshes
 the semantic index, and the heatmap is drawn on that shared document. Closing
@@ -280,8 +288,8 @@ marker to a neighbouring line; ownership follows the handle. Manually removed
 feature bookmarks stay removed during subsequent indexing batches, until the
 search selection is cleared or rebuilt.
 
-The heatmap indicator comes from the host indicator allocator
-(`NPPM_ALLOCATEINDICATOR`). The allocator starts at indicator 9 and skips
+The heatmap obtains its indicator through `npp_alloc_one_indicator`, which
+shares the host allocator used by plugin calls to `NPPM_ALLOCATEINDICATOR`. The allocator starts at indicator 9 and skips
 indicator 9 (incremental search) and indicator 19 (clickable links), so the
 first slot it hands out is 10. Allocation is capped at 20; higher slots belong
 to the editor (including Mark All at 31). Failed requests return output 0. The search

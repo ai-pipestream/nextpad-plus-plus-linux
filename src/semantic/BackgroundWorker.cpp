@@ -17,6 +17,17 @@ void BackgroundWorker::post(std::function<void()> fn)
     cv_.notify_one();
 }
 
+void BackgroundWorker::post_latest(std::function<void()> fn)
+{
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (stop_) return;
+        queue_.clear();
+        queue_.push_back(std::move(fn));
+    }
+    cv_.notify_one();
+}
+
 void BackgroundWorker::set_on_stop(std::function<void()> fn)
 {
     std::lock_guard<std::mutex> lock(mu_);

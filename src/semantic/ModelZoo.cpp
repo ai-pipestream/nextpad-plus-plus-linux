@@ -59,7 +59,7 @@ bool download_url(const std::string &url, const std::string &dest,
         return false;
     }
     CancellableSpawn::Result result = spawn.run({
-        "curl", "-fL",
+        "curl", "-fsSL",
         "--retry", "3",
         "--retry-delay", "1",
         "--max-time", "180",
@@ -72,11 +72,15 @@ bool download_url(const std::string &url, const std::string &dest,
         return false;
     }
     if (!result.started || !result.spawn_error.empty()) {
+        g_message("Semantic model %s: curl could not start: %s", model_id.c_str(),
+                  result.spawn_error.c_str());
         error = ModelZoo::download_failure_message(model_id, !result.started);
         g_unlink(partial.c_str());
         return false;
     }
     if (!result.exited || result.exit_code != 0) {
+        g_message("Semantic model %s: curl exit %d: %s", model_id.c_str(),
+                  result.exit_code, result.stderr_text.c_str());
         error = ModelZoo::download_failure_message(model_id, false, result.exit_code);
         g_unlink(partial.c_str());
         return false;

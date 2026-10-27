@@ -2,6 +2,7 @@
 
 #include "paths.h"
 #include "docmap.h"
+#include "split.h"
 #include "sci_c.h"
 
 #include "BackgroundWorker.h"
@@ -200,6 +201,7 @@ struct Controller {
         if (indicator < 0) return;
         if (sci) configure_indicator_on(sci);
         configure_indicator_on(docmap_scintilla());
+        split_foreach_sci(semantic_search_configure_view);
         if (!track.active()) return;
         /* Indicator style is per view. Every clone of this document
          * needs the same text-foreground style or the shared ranges
@@ -439,7 +441,8 @@ struct Controller {
         if (shut_down || idle_gate().dead.load()) return;
         if (!open || !sci || !doc) return;
         uint64_t gen = build_gen.fetch_add(1) + 1;
-        downloads.cancel();
+        // Document generations invalidate sentence results, not model assets.
+        // Reuse a download already running for this model/backend selection.
         const auto download_ticket = downloads.ticket();
         index_ready = false;
         clear_heatmap();
@@ -466,7 +469,9 @@ struct Controller {
         std::string want_model = model_id;
         std::string want_ep = ep_id;
         set_status("Indexing...", true);
-        worker.post([this, gen, bytes = std::move(bytes), first, q, qgen, want_model, want_ep, download_ticket] {
+        // This build generation supersedes all pending builds and queries.
+        // Keep only its snapshot while the worker finishes a model download.
+        worker.post_latest([this, gen, bytes = std::move(bytes), first, q, qgen, want_model, want_ep, download_ticket] {
             if (idle_gate().dead.load() || worker.stopping() || gen != build_gen.load()) return;
             build_job(gen, bytes, first, q, qgen, want_model, want_ep, download_ticket);
         });
@@ -491,12 +496,13 @@ struct Controller {
         bool have_model = g_file_test(model_path.c_str(), G_FILE_TEST_IS_REGULAR);
         if (!have_model) {
             std::string name = spec->name;
-            post_main([this, gen = build_gen.load(), name] {
-                if (idle_gate().dead.load() || gen != build_gen.load() || !open) return;
+            post_main([this, ticket, name] {
+                if (idle_gate().dead.load() || downloads.cancelled(ticket) || !open) return;
                 set_status("Downloading " + name + "...", true);
             });
         }
         if (!zoo.ensure(*spec, dir, error, &downloads, ticket)) return false;
+        if (downloads.cancelled(ticket)) { error = "cancelled"; return false; }
         OnnxProviderConfig cfg;
         cfg.model_path = dir + "/" + spec->model.filename;
         cfg.vocab_path = dir + "/" + spec->vocab.filename;
@@ -506,6 +512,7 @@ struct Controller {
         cfg.execution_provider = want_ep;
         auto created = make_onnx_provider(cfg, error);
         if (!created) return false;
+        if (downloads.cancelled(ticket)) { error = "cancelled"; return false; }
         cache.clear(); // A new session must never inherit a previous backend's vectors.
         provider = std::move(created);
         loaded_model = spec->id;
@@ -769,7 +776,6 @@ struct Controller {
         }
         build_gen.fetch_add(1);
         query_gen.fetch_add(1);
-        downloads.cancel();
         if (rebuild_timer) {
             g_source_remove(rebuild_timer);
             rebuild_timer = 0;
@@ -885,6 +891,7 @@ void on_model(GObject *, GParamSpec *, gpointer)
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctrl().model_dd));
     if (sel >= ctrl().model_ids.size()) return;
     if (ctrl().model_ids[sel] == ctrl().model_id) return;
+    ctrl().downloads.cancel();
     ctrl().model_id = ctrl().model_ids[sel];
     ctrl().refresh_legend();
     ctrl().save_prefs();
@@ -897,6 +904,7 @@ void on_ep(GObject *, GParamSpec *, gpointer)
     guint sel = gtk_drop_down_get_selected(GTK_DROP_DOWN(ctrl().ep_dd));
     if (sel >= ctrl().ep_ids.size()) return;
     if (ctrl().ep_ids[sel] == ctrl().ep_id) return;
+    ctrl().downloads.cancel();
     ctrl().ep_id = ctrl().ep_ids[sel];
     ctrl().save_prefs();
     if (ctrl().open) ctrl().rebuild_now();
@@ -1096,7 +1104,6 @@ void semantic_search_note_modified(GtkWidget *sci)
     c.configure_indicator();
     c.index_ready = false;
     c.build_gen.fetch_add(1);
-    c.downloads.cancel();
     c.clear_heatmap();
     c.set_status("Indexing...", true);
     c.schedule_rebuild();

@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -289,10 +290,30 @@ void test_job_ticket_survives_download_boundaries()
     expect(fresh.exited && fresh.exit_code == 0, "fresh ticket still runs");
 }
 
+void test_latest_build_replaces_pending_snapshots()
+{
+    BackgroundWorker worker;
+    std::promise<void> entered, release, finished;
+    auto gate = release.get_future().share();
+    std::atomic<int> completed{0};
+    worker.post([&] { entered.set_value(); gate.wait(); });
+    entered.get_future().wait();
+    worker.post([&] { completed.fetch_add(100); }); // stale query
+    worker.post_latest([&] { completed.fetch_add(10); }); // stale snapshot
+    worker.post_latest([&] { completed.fetch_add(1); finished.set_value(); });
+    release.set_value();
+    auto done = finished.get_future();
+    expect(done.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+           "latest build should run after the download finishes");
+    worker.shutdown();
+    expect(completed.load() == 1, "only the newest snapshot runs");
+}
+
 } /* namespace */
 
 int main()
 {
+    test_latest_build_replaces_pending_snapshots();
     test_quit_during_download();
     test_quit_during_embed();
     test_on_stop_runs_on_worker();

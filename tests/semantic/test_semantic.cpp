@@ -18,6 +18,7 @@
 #include "indicator_alloc.h"
 
 #include <glib.h>
+#include <glib/gstdio.h>
 
 #include <chrono>
 #include <cmath>
@@ -648,6 +649,35 @@ void test_manifest_arch_filter()
     g_free(dir);
 }
 
+void test_model_files_reused()
+{
+    gchar *dir = g_dir_make_tmp("npp-sem-reuse-XXXXXX", nullptr);
+    expect(dir != nullptr, "model reuse temporary directory");
+    if (!dir) return;
+    std::string root = dir, source = root + "/source";
+    std::string error, hash;
+    expect(g_file_set_contents(source.c_str(), "cached model fixture", -1, nullptr), "write model fixture");
+    expect(ModelZoo::file_sha256(source, hash, error), error);
+    ModelSpec spec;
+    spec.id = "reuse-test";
+    spec.vocab = {"vocab.txt", "file://" + source, hash};
+    spec.model = {"model.onnx", "file://" + source, hash};
+    CancellableSpawn spawn;
+    int children = 0;
+    spawn.set_pre_lock_hook([&] { ++children; });
+    ModelZoo zoo;
+    expect(zoo.ensure(spec, root + "/cache", error, &spawn), error);
+    expect(children == 2, "first installation downloads vocabulary and model once");
+    std::remove(source.c_str()); // the source is no longer available
+    expect(zoo.ensure(spec, root + "/cache", error, &spawn), error);
+    expect(children == 2, "verified model files are reused without any network request");
+    std::remove((root + "/cache/vocab.txt").c_str());
+    std::remove((root + "/cache/model.onnx").c_str());
+    g_rmdir((root + "/cache").c_str());
+    g_rmdir(root.c_str());
+    g_free(dir);
+}
+
 void test_download_failure_message()
 {
     std::string network = ModelZoo::download_failure_message("offline-demo", false, 6);
@@ -674,7 +704,17 @@ void test_download_failure_message()
     if (!dir) return;
     ModelZoo zoo;
     std::string error;
-    expect(!zoo.ensure(spec, dir, error), "missing file should fail");
+    std::string diagnostic;
+    guint log_handler = g_log_set_handler(nullptr, G_LOG_LEVEL_MESSAGE,
+        [](const gchar *, GLogLevelFlags, const gchar *message, gpointer data) {
+            *static_cast<std::string *>(data) = message;
+        }, &diagnostic);
+    bool installed = zoo.ensure(spec, dir, error);
+    g_log_remove_handler(nullptr, log_handler);
+    expect(!installed, "missing file should fail");
+    expect(diagnostic.find("curl exit 37") != std::string::npos &&
+           diagnostic.find("curl:") != std::string::npos,
+           "curl failure code and stderr must be logged");
     expect(error.find("offline-demo") != std::string::npos, error);
     expect(error.find("not installed") != std::string::npos, error);
     expect(error.find("source file") != std::string::npos, error);
@@ -938,6 +978,7 @@ int main(int argc, char **argv)
     test_manifest();
     test_manifest_arch_filter();
     test_download_failure_message();
+    test_model_files_reused();
     test_backend_label();
     test_embed_fallback_restarts();
     test_document_track_and_handles();

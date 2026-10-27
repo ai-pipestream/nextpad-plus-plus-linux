@@ -24,6 +24,10 @@ public:
     BackgroundWorker &operator=(const BackgroundWorker &) = delete;
 
     void post(std::function<void()> fn);
+    /* Runs on the worker thread after shutdown has been requested, the
+     * running job has returned, and queued jobs have been dropped, and
+     * before the thread exits. Set this before shutdown(). */
+    void set_on_stop(std::function<void()> fn);
     void shutdown();
     bool stopping() const;
 
@@ -33,6 +37,7 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::deque<std::function<void()>> queue_;
+    std::function<void()> on_stop_;
     bool stop_ = false;
     std::thread thread_;
 };

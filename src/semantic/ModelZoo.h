@@ -52,6 +52,10 @@ public:
     static std::string host_arch();
     static bool file_sha256(const std::string &path, std::string &hex, std::string &error);
 
+    /* Status text when a model file is not on disk. `curl_missing` adds
+     * that curl is required. A cancelled download does not use this. */
+    static std::string download_failure_message(const std::string &model_id, bool curl_missing);
+
 private:
     std::string default_id_;
     std::vector<ModelSpec> models_;

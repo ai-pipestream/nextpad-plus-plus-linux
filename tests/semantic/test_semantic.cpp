@@ -4,6 +4,9 @@
  * in and the model files named below are present. Pass --bench to print
  * int8 throughput.
  */
+#include "CancellableSpawn.h"
+#include "DocumentTrack.h"
+#include "EmbedFallback.h"
 #include "ExecutionProviders.h"
 #include "OrtRuntime.h"
 #include "ModelZoo.h"
@@ -11,6 +14,7 @@
 #include "SemanticInterfaces.h"
 #include "SentenceSplitter.h"
 #include "WordPieceTokenizer.h"
+#include "indicator_alloc.h"
 
 #include <glib.h>
 
@@ -20,6 +24,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -573,6 +579,301 @@ int bench()
 
 #endif /* NPP_HAVE_ONNXRUNTIME */
 
+std::string hex64(char fill)
+{
+    return std::string(64, fill);
+}
+
+std::string manifest_model(const std::string &id, const std::string &arch_key)
+{
+    return "    {\n"
+           "      \"id\": \"" + id + "\",\n"
+           "      \"name\": \"" + id + "\",\n"
+           "      \"dimension\": 4,\n"
+           "      \"pooling\": \"mean\",\n"
+           "      \"max_tokens\": 8,\n"
+           "      \"vocab\": {\"filename\": \"vocab.txt\", \"url\": \"file:///missing-vocab\",\n"
+           "        \"sha256\": \"" + hex64('a') + "\"},\n"
+           "      \"model\": {\"" + arch_key + "\": {\"filename\": \"m.onnx\", \"url\": \"file:///missing-model\",\n"
+           "        \"sha256\": \"" + hex64('b') + "\"}}\n"
+           "    }";
+}
+
+bool write_manifest(const std::string &path, const std::string &json)
+{
+    std::ofstream out(path);
+    if (!out) return false;
+    out << json;
+    return out.good();
+}
+
+void test_manifest_arch_filter()
+{
+    std::string arch = ModelZoo::host_arch();
+    std::string other = arch == "aarch64" ? "x86_64" : "aarch64";
+    gchar *dir = g_dir_make_tmp("npp-sem-manifest-XXXXXX", nullptr);
+    expect(dir != nullptr, "manifest tmp");
+    if (!dir) return;
+    std::string path = std::string(dir) + "/models.json";
+
+    std::string keep = "{\n  \"default\": \"keep\",\n  \"models\": [\n" +
+                       manifest_model("skip-me", other) + ",\n" +
+                       manifest_model("keep", "all") + "\n  ]\n}\n";
+    expect(write_manifest(path, keep), "write keep manifest");
+    ModelZoo zoo;
+    std::string error;
+    expect(zoo.load_file(path, error), error.empty() ? "skip other arch" : error);
+    expect(zoo.models().size() == 1, "one model remains");
+    expect(zoo.find("skip-me") == nullptr, "other arch was skipped");
+    expect(zoo.find("keep") != nullptr, "all-arch model kept");
+    expect(zoo.default_id() == "keep", "default kept");
+
+    std::string skipped_default = "{\n  \"default\": \"needs-file\",\n  \"models\": [\n" +
+                                  manifest_model("needs-file", other) + ",\n" +
+                                  manifest_model("keep", "all") + "\n  ]\n}\n";
+    expect(write_manifest(path, skipped_default), "write default-skip manifest");
+    ModelZoo missing_default;
+    expect(!missing_default.load_file(path, error), "default without a file must fail");
+    expect(error.find("needs-file") != std::string::npos, error);
+    expect(error.find("no file") != std::string::npos, error);
+
+    std::string none = "{\n  \"default\": \"absent\",\n  \"models\": [\n" +
+                       manifest_model("one", other) + ",\n" +
+                       manifest_model("two", other) + "\n  ]\n}\n";
+    expect(write_manifest(path, none), "write empty-arch manifest");
+    ModelZoo empty;
+    expect(!empty.load_file(path, error), "no runnable model must fail");
+    expect(error == "manifest lists no models", error);
+    g_free(dir);
+}
+
+void test_download_failure_message()
+{
+    std::string network = ModelZoo::download_failure_message("offline-demo", false);
+    std::string curl = ModelZoo::download_failure_message("offline-demo", true);
+    expect(network.find("offline-demo") != std::string::npos, network);
+    expect(network.find("not installed") != std::string::npos, network);
+    expect(network.find("network") != std::string::npos, network);
+    expect(network.find("curl") == std::string::npos, network);
+    expect(curl.find("curl") != std::string::npos, curl);
+    expect(curl.find("network") != std::string::npos, curl);
+
+    ModelSpec spec;
+    spec.id = "offline-demo";
+    spec.vocab.filename = "vocab.txt";
+    spec.vocab.url = "file:///no/such/npp-semantic-vocab";
+    spec.vocab.sha256 = hex64('a');
+    spec.model.filename = "m.onnx";
+    spec.model.url = "file:///no/such/npp-semantic-model";
+    spec.model.sha256 = hex64('b');
+    gchar *dir = g_dir_make_tmp("npp-sem-dl-XXXXXX", nullptr);
+    expect(dir != nullptr, "download tmp");
+    if (!dir) return;
+    ModelZoo zoo;
+    std::string error;
+    expect(!zoo.ensure(spec, dir, error), "missing file should fail");
+    expect(error.find("offline-demo") != std::string::npos, error);
+    expect(error.find("not installed") != std::string::npos, error);
+    expect(error.find("network") != std::string::npos, error);
+    expect(error.find("curl:") == std::string::npos, error);
+    expect(error != "cancelled", error);
+
+    CancellableSpawn spawn;
+    spawn.retire();
+    std::string cancelled;
+    expect(!zoo.ensure(spec, dir, cancelled, &spawn), "retired download should fail");
+    expect(cancelled == "cancelled", cancelled);
+    g_free(dir);
+}
+
+void test_backend_label()
+{
+    expect(onnx_backend_label(false, "auto", nullptr) == "ONNX Runtime CPU", "automatic cpu");
+    expect(onnx_backend_label(false, "cpu", nullptr) == "ONNX Runtime CPU", "explicit cpu");
+    expect(onnx_backend_label(false, "", nullptr) == "ONNX Runtime CPU", "empty request");
+    expect(onnx_backend_label(false, "cuda", nullptr) == "ONNX Runtime CPU (GPU unavailable)",
+           "explicit cuda");
+    expect(onnx_backend_label(false, "OpenVINO", nullptr) == "ONNX Runtime CPU (GPU unavailable)",
+           "explicit openvino");
+    expect(onnx_backend_label(true, "auto", "cuda") == "ONNX Runtime cuda GPU", "cuda ran");
+    expect(std::string(onnx_cpu_fallback_label()) == "ONNX Runtime CPU (GPU inference failed)",
+           "fallback label");
+}
+
+void test_embed_fallback_restarts()
+{
+    int calls = 0;
+    int resets = 0;
+    int fallbacks = 0;
+    bool gpu = true;
+    std::vector<size_t> seen;
+    std::string error;
+    bool ok = run_embed_batches(
+        3, 2, gpu,
+        [&](size_t base, size_t n, std::vector<size_t> &indexes, std::string &err) {
+            ++calls;
+            if (gpu && base > 0) {
+                err = "gpu batch failed";
+                return false;
+            }
+            indexes.clear();
+            for (size_t k = 0; k < n; ++k) indexes.push_back(base + k);
+            return true;
+        },
+        [&](std::string &err) {
+            ++fallbacks;
+            err.clear();
+            return true;
+        },
+        [&](const std::vector<size_t> &indexes) {
+            if (indexes.empty()) {
+                ++resets;
+                seen.clear();
+                return true;
+            }
+            seen.insert(seen.end(), indexes.begin(), indexes.end());
+            return true;
+        },
+        error);
+    expect(ok, error.empty() ? "restart ok" : error);
+    expect(!gpu, "still marked GPU");
+    expect(fallbacks == 1, "fallback once");
+    expect(resets == 1, "one discard");
+    expect(calls == 4, "every batch ran again");
+    expect(seen.size() == 3 && seen[0] == 0 && seen[1] == 1 && seen[2] == 2, "cpu rows only");
+
+    int fallback_calls = 0;
+    bool stay = false;
+    std::string hard;
+    bool failed = run_embed_batches(
+        1, 1, stay,
+        [&](size_t, size_t, std::vector<size_t> &, std::string &err) {
+            err = "cpu failed";
+            return false;
+        },
+        [&](std::string &) {
+            ++fallback_calls;
+            return true;
+        },
+        {},
+        hard);
+    expect(!failed && hard == "cpu failed", hard);
+    expect(fallback_calls == 0, "cpu failure must not fall back");
+
+    bool again = true;
+    int second = 0;
+    std::string give_up;
+    bool gave = run_embed_batches(
+        1, 1, again,
+        [&](size_t, size_t, std::vector<size_t> &, std::string &err) {
+            err = "still bad";
+            return false;
+        },
+        [&](std::string &err) {
+            ++second;
+            err.clear();
+            return second == 1;
+        },
+        {},
+        give_up);
+    expect(!gave, "second failure must stop");
+    expect(second == 1, "fallback only on the first failure");
+    expect(!again, "gpu flag cleared");
+}
+
+void test_document_track_and_handles()
+{
+    DocumentTrack track;
+    const std::uintptr_t doc = 100;
+    const std::uintptr_t view_a = 1;
+    const std::uintptr_t view_b = 2;
+    expect(track.classify_attach(view_a, doc) == DocAttach::SwitchDocument, "first attach");
+    track.switch_to(view_a, doc);
+    expect(track.classify_attach(view_a, doc) == DocAttach::SameView, "same view");
+    expect(track.classify_attach(view_b, doc) == DocAttach::SameDocument, "clone");
+    track.retarget(view_b);
+    expect(track.view() == view_b && track.doc() == doc, "retarget keeps the document");
+    track.retarget(view_a);
+    expect(track.accepts_modification(doc), "clone edit");
+    expect(!track.accepts_modification(999), "other document");
+
+    std::vector<DocView> both = {{view_a, doc}, {view_b, doc}};
+    DocCloseResult keep = track.classify_close(view_b, doc, both);
+    expect(keep.action == DocClose::Keep, "closing the other clone");
+    track.apply_close(keep);
+    expect(track.view() == view_a && track.doc() == doc, "tracked view stays");
+
+    DocCloseResult retarget = track.classify_close(view_a, doc, both);
+    expect(retarget.action == DocClose::Retarget && retarget.view == view_b, "retarget on close");
+    track.handles().push_back(7);
+    track.apply_close(retarget);
+    expect(track.view() == view_b && track.handles().size() == 1, "handles survive retarget");
+
+    std::vector<DocView> only_b = {{view_b, doc}};
+    DocCloseResult last = track.classify_close(view_b, doc, only_b);
+    expect(last.action == DocClose::ClearLast, "last view");
+    track.apply_close(last);
+    expect(!track.active() && track.handles().empty(), "cleared once");
+
+    std::map<int, int> line_of;
+    std::map<int, unsigned> mask;
+    int next_handle = 1;
+    MarkerFns fns;
+    fns.line_from_handle = [&](int handle) {
+        auto it = line_of.find(handle);
+        return it == line_of.end() ? -1 : it->second;
+    };
+    fns.delete_handle = [&](int handle) { line_of.erase(handle); };
+    fns.mask_on_line = [&](int line) {
+        auto it = mask.find(line);
+        return it == mask.end() ? 0u : it->second;
+    };
+    fns.add_on_line = [&](int line) {
+        int handle = next_handle++;
+        line_of[handle] = line;
+        mask[line] |= 1u;
+        return handle;
+    };
+    std::vector<int> handles;
+    const unsigned bit = 1u;
+    sync_marker_handles(handles, {5}, bit, fns);
+    expect(handles.size() == 1 && line_of[handles[0]] == 5, "added by handle");
+    int kept = handles[0];
+    line_of[kept] = 6;
+    sync_marker_handles(handles, {6}, bit, fns);
+    expect(handles.size() == 1 && handles[0] == kept, "moved line kept its handle");
+    expect(line_of.count(kept) == 1, "handle was not deleted");
+    mask[3] = bit;
+    sync_marker_handles(handles, {3, 6}, bit, fns);
+    expect(handles.size() == 1 && handles[0] == kept, "pre-existing bookmark left alone");
+    line_of.erase(kept);
+    sync_marker_handles(handles, {}, bit, fns);
+    expect(handles.empty(), "gone handle is dropped");
+    expect(mask[3] == bit, "user bookmark remains");
+}
+
+void test_indicator_alloc()
+{
+    int next = NPP_INDICATOR_FIRST;
+    int out = -1;
+    expect(npp_indicator_alloc(&next, 1, &out) && out == 10 && next == 11, "skip indicator 9");
+    next = 18;
+    expect(npp_indicator_alloc(&next, 4, &out) && out == 20 && next == 24, "20 is allocatable");
+    next = 18;
+    expect(npp_indicator_alloc(&next, 12, &out) && out == 20 && next == 32,
+           "twelve slots fit from 20");
+    next = 18;
+    expect(!npp_indicator_alloc(&next, 13, &out), "thirteen slots do not fit");
+    next = 10;
+    expect(npp_indicator_alloc(&next, 9, &out) && out == 10 && next == 19, "range stops before 19");
+    next = 10;
+    expect(npp_indicator_alloc(&next, 10, &out) && out == 20, "range jumps over 19");
+    int untouched = 10;
+    expect(!npp_indicator_alloc(nullptr, 1, &out), "null cursor");
+    expect(!npp_indicator_alloc(&untouched, 0, &out), "empty count");
+    expect(untouched == 10, "failed alloc moved the cursor");
+}
+
 } /* namespace */
 
 int main(int argc, char **argv)
@@ -587,6 +888,12 @@ int main(int argc, char **argv)
     test_sentences();
     test_index();
     test_manifest();
+    test_manifest_arch_filter();
+    test_download_failure_message();
+    test_backend_label();
+    test_embed_fallback_restarts();
+    test_document_track_and_handles();
+    test_indicator_alloc();
     test_providers();
 #if NPP_HAVE_ONNXRUNTIME
     if (do_bench) return bench();

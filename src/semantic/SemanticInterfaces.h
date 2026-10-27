@@ -25,7 +25,9 @@ struct SemanticHit {
 };
 
 /* Called after each length-sorted batch. `original_indexes` are positions
- * in the text list passed to embed_batch. Return false to cancel. */
+ * in the text list passed to embed_batch. An empty list means the GPU
+ * backend failed and every vector from this embed_batch call must be
+ * discarded; later callbacks are the CPU retry. Return false to cancel. */
 using SemanticBatchProgress = std::function<bool(const std::vector<size_t> &original_indexes)>;
 
 class EmbeddingProvider {

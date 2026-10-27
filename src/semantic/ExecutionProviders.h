@@ -41,6 +41,16 @@ struct OnnxProviderConfig {
     std::string execution_provider = "auto"; /* auto, cpu, cuda, openvino */
 };
 
+/* Status-line backend. Automatic and an explicit CPU choice that land
+ * on CPU are "ONNX Runtime CPU". "(GPU unavailable)" is added only when
+ * `requested` names a GPU provider and `used_gpu` is false. */
+std::string onnx_backend_label(bool used_gpu, const std::string &requested, const char *gpu_id);
+
+inline const char *onnx_cpu_fallback_label()
+{
+    return "ONNX Runtime CPU (GPU inference failed)";
+}
+
 std::unique_ptr<EmbeddingProvider> make_onnx_provider(const OnnxProviderConfig &config,
                                                      std::string &error);
 
